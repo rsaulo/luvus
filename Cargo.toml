@@ -62,7 +62,10 @@ unicode-width = "0.2"
 pulldown-cmark = { version = "0.13", default-features = false }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `preserve_order` keeps a user's key order intact when an integration edits
+# their config: a round-trip through the default sorted map would silently
+# rewrite an unrelated file top to bottom.
+serde_json = { version = "1", features = ["preserve_order"] }
 # SHA-256 tracks managed skill files and verifies release, theme, and diff
 # artifacts. The canonical Luvus skill itself is bundled with this release.
 semver = "1"

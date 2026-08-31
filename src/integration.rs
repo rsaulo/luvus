@@ -707,7 +707,144 @@ mod tests {
             "uses the exact server-selected binary before PATH fallback"
         );
         assert!(js.contains("opencode"));
+        assert!(
+            js.contains("export const luvus"),
+            "keeps the V1 named-export shape"
+        );
+        assert!(
+            js.contains("export default"),
+            "V2 auto-loads this directory and rejects a module without a default"
+        );
         assert!(is_installed("opencode"));
+
+        // V2 needs a package directory with an index entrypoint: it rejects a
+        // configured directory without one, and resolves a bare `.js` file as an
+        // npm package, which silently skips it.
+        let package = tmp.join("opencode").join("luvus");
+        let index = fs::read_to_string(package.join("index.js")).unwrap();
+        assert!(
+            index.contains("tui: true"),
+            "the server half advertises the TUI half"
+        );
+        let tui = fs::read_to_string(package.join("tui.js")).unwrap();
+        assert!(
+            tui.contains("export default"),
+            "V2 requires a default export"
+        );
+        assert!(
+            tui.contains("ui.router.current"),
+            "binds the pane's open route"
+        );
+        assert!(
+            tui.contains("process.env.LUVUS_SOCKET_PATH"),
+            "stays inert outside a Luvus pane"
+        );
+        let manifest: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(package.join("package.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest["exports"]["./tui"], "./tui.js");
+
+        let config: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(tmp.join("opencode").join("opencode.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            config["plugin"].as_array().unwrap(),
+            &vec![serde_json::Value::String(format!(
+                "file://{}",
+                package.display()
+            ))],
+            "registered in the server config's `plugin` list"
+        );
+
+        std::env::remove_var("XDG_CONFIG_HOME");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn opencode_install_preserves_unrelated_server_config_and_is_idempotent() {
+        let _env = crate::persist::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("luvus-oc-cfg-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+        let config_path = tmp.join("opencode").join("opencode.json");
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        // Deliberately not alphabetical: a round-trip through a sorted map would
+        // rewrite the whole file, so key order is part of the contract.
+        fs::write(
+            &config_path,
+            r#"{"model":"anthropic/claude","plugin":["file:///other/plugin"],"share":"manual"}"#,
+        )
+        .unwrap();
+
+        install("opencode").unwrap();
+        install("opencode").unwrap(); // idempotent: no duplicate entry
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        let keys: Vec<String> = parsed.as_object().unwrap().keys().cloned().collect();
+        assert_eq!(
+            keys,
+            ["model", "plugin", "share"],
+            "the user's key order survives; only the plugin list changed"
+        );
+
+        let config: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(
+            config["model"], "anthropic/claude",
+            "unrelated keys survive"
+        );
+        assert_eq!(config["share"], "manual");
+        let plugins = config["plugin"].as_array().unwrap();
+        assert_eq!(plugins.len(), 2, "our entry is added exactly once");
+        assert_eq!(plugins[0], "file:///other/plugin", "other plugins survive");
+
+        uninstall("opencode").unwrap();
+        let config: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(
+            config["plugin"].as_array().unwrap(),
+            &vec![serde_json::Value::String("file:///other/plugin".into())],
+            "uninstall drops only our entry"
+        );
+        assert_eq!(config["model"], "anthropic/claude");
+
+        std::env::remove_var("XDG_CONFIG_HOME");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn opencode_install_never_rewrites_a_config_it_cannot_parse() {
+        // OpenCode accepts JSONC. Reformatting one as strict JSON would strip the
+        // user's comments, and treating it as empty would destroy every setting,
+        // so an unreadable config is left exactly as it is.
+        let _env = crate::persist::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("luvus-oc-jsonc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+        let config_path = tmp.join("opencode").join("opencode.json");
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        let original = "{\n  // keep me\n  \"model\": \"anthropic/claude\"\n}\n";
+        fs::write(&config_path, original).unwrap();
+
+        install("opencode").unwrap();
+        assert_eq!(
+            fs::read_to_string(&config_path).unwrap(),
+            original,
+            "a config with comments is never rewritten"
+        );
+        assert!(
+            !is_installed("opencode"),
+            "and the integration reports itself as not wired up"
+        );
+
+        uninstall("opencode").unwrap();
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), original);
 
         std::env::remove_var("XDG_CONFIG_HOME");
         let _ = fs::remove_dir_all(&tmp);
