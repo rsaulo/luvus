@@ -166,7 +166,7 @@ pub fn session_usage(agent: &str, cwd: &Path, session_id: &str) -> Option<AgentU
         )?),
         "copilot" => copilot_usage(&copilot_path(&copilot::sessions::base(), session_id)),
         "opencode" => opencode_usage(
-            &opencode_db_path(&opencode::sessions::base()),
+            &opencode::sessions::database(&opencode::sessions::base()),
             session_id,
             cwd,
         ),
@@ -204,7 +204,7 @@ pub fn session_mtime(agent: &str, cwd: &Path, session_id: &str) -> Option<System
         "claude" => claude_path(&claude::sessions::base(), cwd, session_id),
         "codex" => codex::sessions::session_path(&codex::sessions::base(), session_id)?,
         "copilot" => copilot_path(&copilot::sessions::base(), session_id),
-        "opencode" => opencode_db_path(&opencode::sessions::base()),
+        "opencode" => opencode::sessions::database(&opencode::sessions::base()),
         "kimi" => kimi::sessions::session_dir(&kimi::sessions::base(), session_id)?
             .join("agents/main/wire.jsonl"),
         "grok" => grok::sessions::session_dir(&grok::sessions::base(), cwd, session_id)?
@@ -231,10 +231,6 @@ fn copilot_path(base: &Path, session_id: &str) -> PathBuf {
     base.join("session-state")
         .join(session_id)
         .join("events.jsonl")
-}
-
-fn opencode_db_path(storage: &Path) -> PathBuf {
-    storage.parent().unwrap_or(storage).join("opencode.db")
 }
 
 fn fx_dir(base: &Path, session_id: &str) -> PathBuf {
@@ -410,37 +406,75 @@ fn copilot_usage(path: &Path) -> Option<AgentUsage> {
     finish(usage)
 }
 
+/// OpenCode V2 renamed the session table and split reasoning out of the output
+/// counter. Both statements project the same seven columns so one row mapper
+/// serves either store; V1 has no reasoning counter and reports a literal zero.
+const OPENCODE_V2_ROW: &str = "SELECT model, cost, tokens_input, tokens_output, tokens_reasoning, \
+            tokens_cache_read, tokens_cache_write \
+     FROM session_v2 WHERE id = ?1 AND directory = ?2 LIMIT 1";
+const OPENCODE_V1_ROW: &str = "SELECT model, cost, tokens_input, tokens_output, 0, \
+            tokens_cache_read, tokens_cache_write \
+     FROM session WHERE id = ?1 AND directory = ?2 LIMIT 1";
+
+type OpencodeRow = (Option<String>, f64, i64, i64, i64, i64, i64);
+
+fn opencode_row(
+    conn: &Connection,
+    statement: &str,
+    session_id: &str,
+    cwd: &Path,
+) -> Option<OpencodeRow> {
+    conn.query_row(
+        statement,
+        (session_id, cwd.to_string_lossy().as_ref()),
+        |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, f64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        },
+    )
+    .optional()
+    .ok()?
+}
+
 fn opencode_usage(db: &Path, session_id: &str, cwd: &Path) -> Option<AgentUsage> {
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
         | OpenFlags::SQLITE_OPEN_NO_MUTEX
         | OpenFlags::SQLITE_OPEN_URI;
     let conn = Connection::open_with_flags(db, flags).ok()?;
     let _ = conn.busy_timeout(Duration::from_millis(25));
-    let row = conn
+    // A store holds one layout or the other. Resolve which from the schema
+    // instead of trying both statements, so a busy database still costs a single
+    // bounded wait rather than one wait per candidate table.
+    let has_v2 = conn
         .query_row(
-            "SELECT model, cost, tokens_input, tokens_output, \
-                    tokens_cache_read, tokens_cache_write \
-             FROM session WHERE id = ?1 AND directory = ?2 LIMIT 1",
-            (session_id, cwd.to_string_lossy().as_ref()),
-            |row| {
-                Ok((
-                    row.get::<_, Option<String>>(0)?,
-                    row.get::<_, f64>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, i64>(4)?,
-                    row.get::<_, i64>(5)?,
-                ))
-            },
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_v2' LIMIT 1",
+            [],
+            |_| Ok(()),
         )
         .optional()
-        .ok()??;
+        .ok()?
+        .is_some();
+    let statement = if has_v2 {
+        OPENCODE_V2_ROW
+    } else {
+        OPENCODE_V1_ROW
+    };
+    let row = opencode_row(&conn, statement, session_id, cwd)?;
 
     let as_u64 = |value: i64| u64::try_from(value).unwrap_or(0);
     let mut usage = AgentUsage {
         tokens_in: as_u64(row.2),
-        tokens_out: as_u64(row.3),
-        cache: as_u64(row.4).saturating_add(as_u64(row.5)),
+        // Reasoning tokens are billed as output, so keep them in the same bucket
+        // the pricing table charges at the output rate.
+        tokens_out: as_u64(row.3).saturating_add(as_u64(row.4)),
+        cache: as_u64(row.5).saturating_add(as_u64(row.6)),
         ..AgentUsage::default()
     };
     if let Some(raw_model) = row.0 {
@@ -708,6 +742,101 @@ mod tests {
             ],
         )
         .unwrap();
+    }
+
+    /// The OpenCode V2 store, reduced to the columns Mission Control reads.
+    fn create_opencode_v2_schema(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE session_v2 (
+                id TEXT PRIMARY KEY,
+                directory TEXT NOT NULL,
+                model TEXT,
+                cost REAL NOT NULL,
+                tokens_input INTEGER NOT NULL,
+                tokens_output INTEGER NOT NULL,
+                tokens_reasoning INTEGER NOT NULL,
+                tokens_cache_read INTEGER NOT NULL,
+                tokens_cache_write INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+    }
+
+    fn insert_opencode_v2_session(
+        conn: &Connection,
+        id: &str,
+        directory: &str,
+        model: &str,
+        cost: f64,
+        tokens: [i64; 5],
+    ) {
+        conn.execute(
+            "INSERT INTO session_v2 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                id, directory, model, cost, tokens[0], tokens[1], tokens[2], tokens[3], tokens[4]
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn opencode_v2_reads_renamed_table_and_bills_reasoning_as_output() {
+        // V2 renamed `session` to `session_v2` and split reasoning out of the
+        // output counter. Reasoning is billed at the output rate, so it belongs
+        // in the same bucket the pricing table charges.
+        let dir = tmp("opencode-v2");
+        let db = dir.join("opencode.db");
+        let conn = Connection::open(&db).unwrap();
+        create_opencode_v2_schema(&conn);
+        insert_opencode_v2_session(
+            &conn,
+            "ses-v2",
+            "/work/app",
+            r#"{"id":"claude-opus-5","providerID":"anthropic"}"#,
+            1.25,
+            [100, 20, 7, 30, 4],
+        );
+
+        let usage = opencode_usage(&db, "ses-v2", Path::new("/work/app")).unwrap();
+        assert_eq!(usage.model, "claude-opus-5", "the model id is unwrapped");
+        assert_eq!(usage.tokens_in, 100);
+        assert_eq!(usage.tokens_out, 27, "output + reasoning");
+        assert_eq!(usage.cache, 34, "cache read + write");
+        assert_eq!(usage.cost, Some(1.25), "a persisted cost is authoritative");
+
+        assert!(opencode_usage(&db, "ses-v2", Path::new("/work/other")).is_none());
+        assert!(opencode_usage(&db, "missing", Path::new("/work/app")).is_none());
+        drop(conn);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn opencode_v2_subscription_zero_cost_falls_back_to_the_estimate() {
+        // On a subscription OpenCode persists `cost = 0` because no per-request
+        // API charge exists. Mission Control still shows an API-equivalent
+        // estimate rather than claiming the session was free.
+        let dir = tmp("opencode-v2-subscription");
+        let db = dir.join("opencode.db");
+        let conn = Connection::open(&db).unwrap();
+        create_opencode_v2_schema(&conn);
+        insert_opencode_v2_session(
+            &conn,
+            "ses-sub",
+            "/work/sub",
+            r#"{"id":"gpt-5","providerID":"openai"}"#,
+            0.0,
+            [1000, 200, 100, 300, 40],
+        );
+
+        let usage = opencode_usage(&db, "ses-sub", Path::new("/work/sub")).unwrap();
+        assert_eq!(usage.tokens_out, 300, "output + reasoning");
+        assert_eq!(
+            usage.cost,
+            estimate_cost("gpt-5", 1000, 300, 340),
+            "zero persisted cost falls through to the pricing table"
+        );
+        drop(conn);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

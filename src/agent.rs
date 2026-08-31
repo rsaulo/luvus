@@ -443,7 +443,9 @@ mod tests {
     fn opencode_discovers_session_by_directory() {
         // Sessions carry a `directory` field; discovery matches by cwd, dedups per
         // project, and skips a malformed sibling file (docs/23 NI-3).
-        let base = tmp("opencode");
+        // The store is nested exactly as it ships (`.../opencode/storage`) so the
+        // sibling V2 database path resolves inside the fixture, not beside it.
+        let base = tmp("opencode").join("storage");
         let proj = base.join("session").join("p1");
         fs::create_dir_all(&proj).unwrap();
         fs::write(
@@ -474,6 +476,113 @@ mod tests {
             "two project dirs; the broken file is skipped"
         );
         assert!(recent.iter().all(|s| s.agent == "opencode"));
+    }
+
+    /// One `session_v2` fixture row: id, parent, directory, updated, archived.
+    type OpencodeV2Row<'a> = (&'a str, Option<&'a str>, &'a str, i64, Option<i64>);
+
+    /// Build an OpenCode V2 store beside `base` and fill it with `rows`.
+    fn opencode_v2_store(base: &Path, rows: &[OpencodeV2Row<'_>]) {
+        let database = base.parent().unwrap().join("opencode.db");
+        let conn = rusqlite::Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session_v2 (
+                id TEXT PRIMARY KEY,
+                parent_id TEXT,
+                directory TEXT NOT NULL,
+                time_updated INTEGER NOT NULL,
+                time_archived INTEGER
+            );",
+        )
+        .unwrap();
+        for (id, parent, directory, updated, archived) in rows {
+            conn.execute(
+                "INSERT INTO session_v2 (id, parent_id, directory, time_updated, time_archived) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![id, parent, directory, updated, archived],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn opencode_v2_discovers_root_sessions_from_the_database() {
+        // V2 replaced the per-session JSON files with one SQLite store. Only
+        // resumable root rows count: a subagent carries `parent_id` and must not
+        // mask its parent even when it is the newer row for that directory.
+        let base = tmp("opencode-v2").join("storage");
+        fs::create_dir_all(&base).unwrap();
+        opencode_v2_store(
+            &base,
+            &[
+                ("ses_root", None, "/work/app", 100, None),
+                ("ses_child", Some("ses_root"), "/work/app", 900, None),
+                ("ses_old", None, "/work/app", 50, None),
+                ("ses_api", None, "/work/api", 200, None),
+                ("ses_gone", None, "/work/archived", 300, Some(400)),
+            ],
+        );
+
+        assert_eq!(
+            opencode_latest(&base, Path::new("/work/app")).as_deref(),
+            Some("ses_root"),
+            "the newest root row wins; the newer subagent row is not resumable"
+        );
+        assert_eq!(
+            opencode_latest(&base, Path::new("/work/api")).as_deref(),
+            Some("ses_api")
+        );
+        assert!(
+            opencode_latest(&base, Path::new("/work/archived")).is_none(),
+            "an archived session is not offered for resume"
+        );
+        assert!(opencode_latest(&base, Path::new("/no/such")).is_none());
+
+        let recent = opencode_recent(&base, 10);
+        assert_eq!(recent.len(), 2, "one row per directory");
+        assert_eq!(recent[0].session_id, "ses_api", "newest directory first");
+        assert!(recent.iter().all(|s| s.agent == "opencode"));
+    }
+
+    #[test]
+    fn opencode_merges_v1_files_with_the_v2_database() {
+        // An upgraded install keeps both stores. Neither may hide the other, and
+        // the newest row for a directory wins.
+        let base = tmp("opencode-both").join("storage");
+        let proj = base.join("session").join("p1");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(
+            proj.join("legacy.json"),
+            r#"{"id":"ses_v1","directory":"/work/legacy"}"#,
+        )
+        .unwrap();
+        // Dated far in the past so the V2 row is unambiguously newer.
+        opencode_v2_store(&base, &[("ses_v2", None, "/work/fresh", 1, None)]);
+
+        assert_eq!(
+            opencode_latest(&base, Path::new("/work/legacy")).as_deref(),
+            Some("ses_v1"),
+            "a V1-only directory stays discoverable after the V2 store appears"
+        );
+        assert_eq!(
+            opencode_latest(&base, Path::new("/work/fresh")).as_deref(),
+            Some("ses_v2")
+        );
+        assert_eq!(opencode_recent(&base, 10).len(), 2);
+    }
+
+    #[test]
+    fn opencode_missing_and_incompatible_databases_are_non_fatal() {
+        // V1 installs have no database at all, and a foreign file must not panic
+        // or take the JSON tree down with it.
+        let base = tmp("opencode-bad").join("storage");
+        fs::create_dir_all(&base).unwrap();
+        assert!(opencode_recent(&base, 10).is_empty());
+        assert!(opencode_latest(&base, Path::new("/work/app")).is_none());
+
+        fs::write(base.parent().unwrap().join("opencode.db"), "not a database").unwrap();
+        assert!(opencode_recent(&base, 10).is_empty());
+        assert!(opencode_latest(&base, Path::new("/work/app")).is_none());
     }
 
     #[test]
