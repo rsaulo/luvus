@@ -4,6 +4,41 @@ Shared maintainer guidance for coding agents working in the Luvus repository.
 This file is the repository-level source of truth. Tool-specific instruction
 files may add guidance, but they must not contradict it.
 
+## Personal integration branch
+
+These instructions apply only to the long-lived local
+`feat/rsaulo-luvus` branch and its current worktree. This branch is Rogerio's
+personal integration branch and the source of his locally installed Luvus
+build. It may be published to Rogerio's public fork, but it must never be
+pushed or proposed for merge into the upstream repository.
+
+- Keep `origin` pointed at the canonical `RizRiyz/luvus` repository and `fork`
+  pointed at the public `rsaulo/luvus` fork. Keep `remote.pushDefault=fork` so
+  an authorized push defaults to the fork, never upstream.
+- Keep the local `main` tracking `origin/main`, which is the source of truth.
+  Keep `fork/main` as an unmodified, fast-forward mirror by fetching `origin`
+  and pushing `origin/main:main` to `fork`; never put personal commits on
+  `main` and never force the mirror.
+- Before starting new local work, verify the worktree, obtain the user's
+  authorization to fetch, synchronize the two `main` branches, then merge the
+  latest `origin/main` into `feat/rsaulo-luvus`. Preserve local customizations;
+  do not rebase, force-push, or rewrite the personal integration branch.
+- Make personal integration commits on `feat/rsaulo-luvus`, push that branch
+  only to `fork` when authorized, and build the locally installed release
+  binary from the resulting integration state.
+- Prepare each upstream contribution on a separate, short-lived branch based
+  on the latest `origin/main`, using this same worktree. Cherry-pick or reapply
+  only the focused contribution, push that branch to `fork`, and open the PR
+  against `RizRiyz/luvus:main`.
+- Keep upstream PRs focused. Never include this branch-only section, unrelated
+  personal patches, or integration-branch history in a contribution branch.
+- After contribution work, return this worktree to `feat/rsaulo-luvus`. After
+  an accepted PR reaches upstream `main`, refresh `origin/main`, mirror it to
+  `fork/main`, and merge it back into the integration branch.
+- Do not push, open PRs, merge, or switch branches unless the user explicitly
+  authorizes the action. Never add this local workflow commit to an upstream
+  contribution branch.
+
 ## Start with current evidence
 
 Luvus changes quickly. Before describing behavior or editing a subsystem:
