@@ -920,7 +920,7 @@ mod tests {
     }
 
     #[test]
-    fn prefix_question_opens_help_and_any_key_closes() {
+    fn prefix_question_opens_scrollable_help_and_other_keys_close() {
         use crate::event::AppEvent;
         use ratatui::crossterm::event::KeyModifiers;
         let prefix = || AppEvent::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL));
@@ -932,7 +932,21 @@ mod tests {
         app.handle_event(prefix());
         app.handle_event(ch('?')); // Ctrl+Space ? opens the cheat-sheet
         assert!(app.help_open, "? opened the help overlay");
-        app.handle_event(ch('x')); // any key dismisses it (and is swallowed)
+        app.handle_event(ch('j'));
+        assert!(app.help_open, "navigation keeps the overlay open");
+        assert_eq!(app.help_scroll, 1);
+        app.help_scroll_max = 40;
+        app.handle_event(AppEvent::Key(KeyEvent::new(
+            KeyCode::End,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.help_scroll, 40);
+        app.handle_event(AppEvent::Key(KeyEvent::new(
+            KeyCode::Up,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.help_scroll, 39, "up moves away from the bottom");
+        app.handle_event(ch('x')); // a non-navigation key dismisses it (and is swallowed)
         assert!(!app.help_open, "next key closed the overlay");
         // The swallowed key must not have acted (e.g. closed a pane).
         assert_eq!(app.panes.len(), 1);
