@@ -1384,6 +1384,7 @@ mod tests {
 
     #[test]
     fn omp_is_a_recognized_skill_host_by_dir_or_binary() {
+        let _env = crate::persist::test_env("skill-omp-host");
         // Detection must fire on either signal: the ~/.omp/agent config dir
         // or the omp executable on PATH. OMP receives its own managed skill
         // copy because profiles and PI_CODING_AGENT_DIR can isolate agent data.
@@ -1404,6 +1405,7 @@ mod tests {
 
     #[test]
     fn hermes_detection_respects_a_custom_home_without_a_path_binary() {
+        let _env = crate::persist::test_env("skill-hermes-custom-home");
         let root = crate::persist::skills_dir().join("hermes-custom-home");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();

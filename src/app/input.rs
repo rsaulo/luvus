@@ -518,6 +518,18 @@ impl App {
                 }
                 return true;
             }
+            AppEvent::NamedSessionsLoaded { generation, result } => {
+                self.apply_named_sessions_loaded(generation, result);
+                return true;
+            }
+            AppEvent::NamedSessionPrepared {
+                generation,
+                name,
+                result,
+            } => {
+                self.apply_named_session_prepared(generation, name, result);
+                return true;
+            }
             other => other,
         };
         // Control-API requests and parked `wait.output` replies must be answered
@@ -783,12 +795,27 @@ impl App {
                 branches,
                 workspace_candidates,
             } => self.apply_cwd_scan(panes, branches, workspace_candidates),
-            // Mission Control usage (docs/54, MC-2): swap in the fresh cache; the
-            // mission render blits it. Repaint so a visible mission tab updates.
-            AppEvent::UsageScanned { usage, mtimes } => {
+            // Mission Control usage (docs/54, MC-2): replace a fleet scan or
+            // merge only the keys covered by a workspace scan. Repaint so a
+            // visible mission tab updates.
+            AppEvent::UsageScanned {
+                scope,
+                scanned,
+                usage,
+                mtimes,
+            } => {
                 self.usage_scan_inflight = false;
-                self.agent_usage = usage;
-                self.usage_mtimes = mtimes;
+                if scope == crate::mission::MissionScope::All {
+                    self.agent_usage = usage;
+                    self.usage_mtimes = mtimes;
+                } else {
+                    for key in scanned {
+                        self.agent_usage.remove(&key);
+                        self.usage_mtimes.remove(&key);
+                    }
+                    self.agent_usage.extend(usage);
+                    self.usage_mtimes.extend(mtimes);
+                }
                 // Fleet burn rate: change in total cost since the last scan (docs/54).
                 let total: f64 = self.agent_usage.values().filter_map(|u| u.cost).sum();
                 let now = std::time::Instant::now();
@@ -964,6 +991,9 @@ impl App {
             | AppEvent::SearchResults { .. }
             | AppEvent::SearchFederatedResults { .. }
             | AppEvent::SearchHandoffReady { .. } => unreachable!(),
+            AppEvent::NamedSessionsLoaded { .. } | AppEvent::NamedSessionPrepared { .. } => {
+                unreachable!()
+            }
         }
     }
 
@@ -999,6 +1029,9 @@ impl App {
     /// all single-line fields.
     fn paste_into_modal(&mut self, s: &str) -> bool {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        if self.named_session_menu.is_some() {
+            return self.paste_named_session_prompt(s);
+        }
         if self.module_setting_edit.is_some() {
             for character in s.chars().filter(|character| !character.is_control()) {
                 self.handle_module_setting_key(KeyEvent::new(
@@ -1090,6 +1123,18 @@ impl App {
         let (c, r) = at?;
         let hit = |rect: Rect| c >= rect.x && c < rect.right() && r >= rect.y && r < rect.bottom();
         let first = |rects: &[Rect]| rects.iter().copied().find(|rect| hit(*rect));
+
+        if self.named_session_menu.is_some() {
+            return self
+                .named_session_close_rect
+                .filter(|rect| hit(*rect))
+                .or_else(|| {
+                    self.named_session_row_rects
+                        .iter()
+                        .map(|(_, rect)| *rect)
+                        .find(|rect| hit(*rect))
+                });
+        }
 
         if self.changelog_open {
             return self
@@ -1208,6 +1253,7 @@ impl App {
             .chain(self.diff_row_rects.iter().map(|(_, rect)| *rect))
             .chain(
                 [
+                    self.named_session_button_rect,
                     self.switcher_button_rect,
                     self.mobile_pane_prev_rect,
                     self.mobile_pane_next_rect,
@@ -1261,6 +1307,17 @@ impl App {
                     self.help_scroll = self.help_scroll.saturating_add(2).min(self.help_scroll_max)
                 }
                 MouseEventKind::Down(MouseButton::Left) => self.help_open = false,
+                _ => {}
+            }
+            return;
+        }
+        if self.named_session_menu.is_some() {
+            match m.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    self.named_session_click(m.column, m.row)
+                }
+                MouseEventKind::ScrollUp => self.move_named_session_cursor(-1),
+                MouseEventKind::ScrollDown => self.move_named_session_cursor(1),
                 _ => {}
             }
             return;
@@ -2150,6 +2207,10 @@ impl App {
         }
 
         // The sidebar gear opens Settings.
+        if self.named_session_button_rect.is_some_and(hit) {
+            self.open_named_session_menu();
+            return;
+        }
         if self.settings_icon_rect.is_some_and(hit) {
             self.open_settings();
             return;
@@ -2524,7 +2585,8 @@ impl App {
                     // forwarded, so typing to the agent resumes with no lost key.
                     pane.scroll_to_bottom();
                     exit = true;
-                    if let Some(bytes) = encode_key(&key, newline, pane.application_cursor()) {
+                    let (app_cursor, disambiguate) = pane.key_encoding_modes();
+                    if let Some(bytes) = encode_key(&key, newline, app_cursor, disambiguate) {
                         pane.send(&bytes);
                     }
                 }
@@ -3282,6 +3344,10 @@ impl App {
             self.handle_module_setting_key(key);
             return true;
         }
+        if self.named_session_menu.is_some() {
+            self.named_session_key(key);
+            return true;
+        }
         // The Settings modal captures all input while open.
         if self.settings.is_some() {
             self.handle_settings_key(key);
@@ -3402,6 +3468,15 @@ impl App {
         if self.mode == Mode::Resize {
             return self.handle_resize_mode_key(key);
         }
+        // Explicit direct shortcuts are the only normal-mode keys Luvus takes
+        // before pane/dashboard dispatch. The configured prefix retains
+        // precedence, and an empty direct map makes this a cheap no-op.
+        if self.mode == Mode::Normal && !self.prefix.matches(&key) {
+            if let Some(command) = keys::direct_command(&self.direct_keymap, &key) {
+                self.run_cmd(command);
+                return true;
+            }
+        }
         // FILES/DIFF dock focus is explicit and separate from terminal-pane
         // focus. The prefix remains available for global commands; ordinary
         // keys never leak into the pane until Esc/q returns control to it.
@@ -3442,11 +3517,12 @@ impl App {
                 if self.prefix.matches(&key) {
                     let prefix = self.prefix.key_event();
                     let newline = self.config.shift_enter_bytes().to_vec();
-                    let app_cursor = self.focused().is_some_and(|p| p.application_cursor());
-                    if let (Some(p), Some(bytes)) =
-                        (self.focused(), encode_key(&prefix, &newline, app_cursor))
-                    {
-                        p.send(&bytes);
+                    if let Some(pane) = self.focused() {
+                        let (app_cursor, disambiguate) = pane.key_encoding_modes();
+                        if let Some(bytes) = encode_key(&prefix, &newline, app_cursor, disambiguate)
+                        {
+                            pane.send(&bytes);
+                        }
                     }
                     return true; // left prefix mode → the status bar updates
                 }
@@ -3533,8 +3609,11 @@ impl App {
                 let newline = self.config.shift_enter_bytes();
                 // Cursor keys follow the pane's DECCKM state: a `less` that
                 // turned application cursor mode on only recognizes SS3 codes.
-                let app_cursor = self.focused().is_some_and(|p| p.application_cursor());
-                if let Some(bytes) = encode_key(&key, newline, app_cursor) {
+                let (app_cursor, disambiguate) = self
+                    .focused()
+                    .map(|pane| pane.key_encoding_modes())
+                    .unwrap_or((false, false));
+                if let Some(bytes) = encode_key(&key, newline, app_cursor, disambiguate) {
                     if let Some(p) = self.focused() {
                         // Typing snaps the view back to the live bottom, so you
                         // always see what you type (like every terminal).
@@ -3654,7 +3733,12 @@ fn mouse_wheel_seq(up: bool, col: u16, row: u16, sgr: bool) -> Vec<u8> {
 /// (`ESC O <letter>`) when the app enabled application cursor mode, exactly as a
 /// real terminal would send them — some apps (`less`) only recognize the SS3
 /// form once they've turned the mode on.
-fn encode_key(key: &KeyEvent, newline: &[u8], app_cursor: bool) -> Option<Vec<u8>> {
+fn encode_key(
+    key: &KeyEvent,
+    newline: &[u8],
+    app_cursor: bool,
+    disambiguate: bool,
+) -> Option<Vec<u8>> {
     // AltGr arrives as Ctrl+Alt on Windows (`keys::is_ctrl_chord`) and types a
     // character — it is neither a Ctrl chord nor an `ESC`-prefixed Alt key.
     let ctrl = super::keys::is_ctrl_chord(key.modifiers);
@@ -3668,6 +3752,35 @@ fn encode_key(key: &KeyEvent, newline: &[u8], app_cursor: bool) -> Option<Vec<u8
     let bytes: Vec<u8> = match key.code {
         KeyCode::Char(c) => {
             if ctrl {
+                if disambiguate {
+                    let codepoint = match c {
+                        // Crossterm represents a legacy 0x1f input byte as
+                        // Ctrl+7. The originating terminal could not
+                        // distinguish it from Ctrl+/, so prefer the user-facing
+                        // slash binding when the nested application requests
+                        // an unambiguous key sequence.
+                        '/' | '7' => Some('/'),
+                        '_' => Some('_'),
+                        // A Ctrl chord on a letter is folded through
+                        // `to_ascii_uppercase() & 0x1f` below, which is caseless:
+                        // Ctrl+Shift+P and Ctrl+P both become 0x10, so an agent
+                        // binding Ctrl+Shift+<letter> silently gets the
+                        // unshifted action. Report the *unshifted* codepoint and
+                        // let `key_modifier_param` carry Shift, as the protocol
+                        // requires — Ctrl+Shift+P is `CSI 112;6u`, never
+                        // `CSI 80;...`, since the shifted codepoint would
+                        // reintroduce the very ambiguity being resolved.
+                        //
+                        // Only diverted when Shift is present: plain Ctrl+P is
+                        // already unambiguous as 0x10, and the disambiguate
+                        // level leaves such keys in their legacy form.
+                        'a'..='z' | 'A'..='Z' if shift => Some(c.to_ascii_lowercase()),
+                        _ => None,
+                    };
+                    if let Some(codepoint) = codepoint {
+                        return Some(csi_u_char(codepoint, key.modifiers));
+                    }
+                }
                 let b = match c.to_ascii_lowercase() {
                     'a'..='z' => (c.to_ascii_uppercase() as u8) & 0x1f,
                     ' ' | '@' => 0,
@@ -3675,7 +3788,10 @@ fn encode_key(key: &KeyEvent, newline: &[u8], app_cursor: bool) -> Option<Vec<u8
                     '\\' => 0x1c,
                     ']' => 0x1d,
                     '^' => 0x1e,
-                    '_' => 0x1f,
+                    // Ctrl+/ is the user-facing chord for the US control byte.
+                    // Legacy terminal input arrives through crossterm as
+                    // Ctrl+7, while enhanced keyboard protocols preserve `/`.
+                    '_' | '/' | '7' => 0x1f,
                     _ => return None,
                 };
                 if alt {
@@ -3705,7 +3821,13 @@ fn encode_key(key: &KeyEvent, newline: &[u8], app_cursor: bool) -> Option<Vec<u8
         KeyCode::Enter => vec![b'\r'],
         KeyCode::Tab => vec![b'\t'],
         KeyCode::BackTab => vec![0x1b, b'[', b'Z'],
-        KeyCode::Backspace => vec![0x7f],
+        KeyCode::Backspace => {
+            if alt {
+                vec![0x1b, 0x7f]
+            } else {
+                vec![0x7f]
+            }
+        }
         KeyCode::Esc => vec![0x1b],
         // Keep navigation modifiers intact. Crossterm reports these directly
         // from Windows console records, while terminals on Unix report them via
@@ -3751,6 +3873,15 @@ fn encode_key(key: &KeyEvent, newline: &[u8], app_cursor: bool) -> Option<Vec<u8
 
 fn csi(final_byte: u8) -> Vec<u8> {
     vec![0x1b, b'[', final_byte]
+}
+
+fn csi_u_char(character: char, modifiers: KeyModifiers) -> Vec<u8> {
+    format!(
+        "\x1b[{};{}u",
+        character as u32,
+        key_modifier_param(modifiers)
+    )
+    .into_bytes()
 }
 
 /// Encode a cursor key (arrows / Home / End). In application cursor mode
@@ -4132,7 +4263,8 @@ mod tests {
     fn shift_enter_sends_a_newline_not_a_submit() {
         // The default newline sequence is `ESC CR`.
         let nl = b"\x1b\r";
-        let enter = |m: KeyModifiers| encode_key(&KeyEvent::new(KeyCode::Enter, m), nl, false);
+        let enter =
+            |m: KeyModifiers| encode_key(&KeyEvent::new(KeyCode::Enter, m), nl, false, false);
         assert_eq!(
             enter(KeyModifiers::NONE),
             Some(b"\r".to_vec()),
@@ -4153,6 +4285,7 @@ mod tests {
             encode_key(
                 &KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
                 nl,
+                false,
                 false
             ),
             Some(b"\r".to_vec())
@@ -4167,8 +4300,9 @@ mod tests {
     fn altgr_types_its_character_instead_of_a_control_byte() {
         let nl = b"\x1b\r";
         let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
-        let enc =
-            |c: char, m: KeyModifiers| encode_key(&KeyEvent::new(KeyCode::Char(c), m), nl, false);
+        let enc = |c: char, m: KeyModifiers| {
+            encode_key(&KeyEvent::new(KeyCode::Char(c), m), nl, false, false)
+        };
         if cfg!(windows) {
             for c in ['\\', '@', '#', '[', ']', '{', '}', '|', '~', '€'] {
                 assert_eq!(
@@ -4195,7 +4329,7 @@ mod tests {
         // The exception is for characters only: every other key keeps both
         // modifiers, so Ctrl+Alt+Enter is still a modified Enter.
         assert_eq!(
-            encode_key(&KeyEvent::new(KeyCode::Enter, altgr), nl, false),
+            encode_key(&KeyEvent::new(KeyCode::Enter, altgr), nl, false, false),
             Some(nl.to_vec()),
             "Ctrl+Alt+Enter still sends the configured newline"
         );
@@ -4206,14 +4340,20 @@ mod tests {
     #[test]
     fn shift_enter_sequence_is_configurable() {
         let shift = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
-        assert_eq!(encode_key(&shift, b"\n", false), Some(b"\n".to_vec()));
         assert_eq!(
-            encode_key(&shift, b"\x1b[13;2u", false),
+            encode_key(&shift, b"\n", false, false),
+            Some(b"\n".to_vec())
+        );
+        assert_eq!(
+            encode_key(&shift, b"\x1b[13;2u", false, false),
             Some(b"\x1b[13;2u".to_vec())
         );
         // Plain Enter ignores the newline sequence and always submits.
         let plain = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-        assert_eq!(encode_key(&plain, b"\n", false), Some(b"\r".to_vec()));
+        assert_eq!(
+            encode_key(&plain, b"\n", false, false),
+            Some(b"\r".to_vec())
+        );
     }
 
     #[test]
@@ -4222,6 +4362,7 @@ mod tests {
             encode_key(
                 &KeyEvent::new(KeyCode::Char('a'), modifiers),
                 b"\x1b\r",
+                false,
                 false,
             )
         };
@@ -4234,8 +4375,92 @@ mod tests {
     }
 
     #[test]
+    fn alt_backspace_sends_meta_delete_for_word_deletion() {
+        let key = |modifiers, disambiguate| {
+            encode_key(
+                &KeyEvent::new(KeyCode::Backspace, modifiers),
+                b"\x1b\r",
+                false,
+                disambiguate,
+            )
+        };
+
+        for disambiguate in [false, true] {
+            assert_eq!(key(KeyModifiers::NONE, disambiguate), Some(vec![0x7f]));
+            assert_eq!(key(KeyModifiers::ALT, disambiguate), Some(vec![0x1b, 0x7f]));
+        }
+    }
+
+    #[test]
+    fn control_slash_reaches_nested_tuis_across_terminal_encodings() {
+        let encode = |character, disambiguate| {
+            encode_key(
+                &KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL),
+                b"\x1b\r",
+                false,
+                disambiguate,
+            )
+        };
+
+        assert_eq!(encode('/', false), Some(vec![0x1f]));
+        assert_eq!(
+            encode('7', false),
+            Some(vec![0x1f]),
+            "crossterm decodes the legacy 0x1f byte as Ctrl+7"
+        );
+        assert_eq!(encode('_', false), Some(vec![0x1f]));
+
+        assert_eq!(encode('/', true), Some(b"\x1b[47;5u".to_vec()));
+        assert_eq!(
+            encode('7', true),
+            Some(b"\x1b[47;5u".to_vec()),
+            "a legacy Ctrl+/ alias regains slash identity for a nested CSI-u client"
+        );
+        assert_eq!(encode('_', true), Some(b"\x1b[95;5u".to_vec()));
+    }
+
+    /// `Ctrl+Shift+<letter>` must survive the trip to a nested TUI. The legacy
+    /// fold `to_ascii_uppercase() & 0x1f` is caseless, so it maps Ctrl+Shift+P
+    /// and Ctrl+P onto the same 0x10 and an agent binding the shifted chord
+    /// silently gets the unshifted action instead.
+    #[test]
+    fn control_shift_letters_reach_nested_tuis_distinctly() {
+        let encode = |character, modifiers, disambiguate| {
+            encode_key(
+                &KeyEvent::new(KeyCode::Char(character), modifiers),
+                b"\x1b\r",
+                false,
+                disambiguate,
+            )
+        };
+        let ctrl = KeyModifiers::CONTROL;
+        let ctrl_shift = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+
+        // Legacy encoding cannot separate them; this is the collapse itself.
+        assert_eq!(encode('p', ctrl, false), Some(vec![0x10]));
+        assert_eq!(encode('p', ctrl_shift, false), Some(vec![0x10]));
+
+        // A CSI-u client gets distinct sequences. The codepoint stays lowercase
+        // `p` (112) and Shift rides in the modifier param: 5 = ctrl, 6 = ctrl+shift.
+        assert_eq!(encode('p', ctrl, true), Some(vec![0x10]));
+        assert_eq!(encode('p', ctrl_shift, true), Some(b"\x1b[112;6u".to_vec()));
+        assert_ne!(encode('p', ctrl, true), encode('p', ctrl_shift, true));
+
+        // Crossterm may report the shifted press as uppercase; it must still
+        // report 112, never 80, or the ambiguity returns.
+        assert_eq!(encode('P', ctrl_shift, true), Some(b"\x1b[112;6u".to_vec()));
+
+        // Unshifted Ctrl chords keep their legacy bytes, and plain typing and
+        // Shift-only capitals are untouched by the protocol.
+        assert_eq!(encode('a', ctrl, true), Some(vec![0x01]));
+        assert_eq!(encode('A', KeyModifiers::SHIFT, true), Some(b"A".to_vec()));
+        assert_eq!(encode('a', KeyModifiers::NONE, true), Some(b"a".to_vec()));
+    }
+
+    #[test]
     fn navigation_keys_preserve_modifiers_for_nested_prompt_editors() {
-        let key = |code, modifiers| encode_key(&KeyEvent::new(code, modifiers), b"\x1b\r", false);
+        let key =
+            |code, modifiers| encode_key(&KeyEvent::new(code, modifiers), b"\x1b\r", false, false);
 
         // The existing unmodified sequences stay byte-for-byte compatible.
         assert_eq!(
@@ -4283,7 +4508,8 @@ mod tests {
         // When the pane enabled DECCKM (`ESC[?1h`), unmodified cursor keys go out
         // as SS3 (`ESC O <letter>`) — the bytes a real terminal sends once the
         // app turned the mode on. `less` is strict about this and ignores CSI.
-        let app = |code, modifiers| encode_key(&KeyEvent::new(code, modifiers), b"\x1b\r", true);
+        let app =
+            |code, modifiers| encode_key(&KeyEvent::new(code, modifiers), b"\x1b\r", true, false);
         assert_eq!(
             app(KeyCode::Up, KeyModifiers::NONE),
             Some(b"\x1bOA".to_vec())
@@ -4322,7 +4548,8 @@ mod tests {
 
     #[test]
     fn tilde_navigation_keys_preserve_modifiers() {
-        let key = |code, modifiers| encode_key(&KeyEvent::new(code, modifiers), b"\x1b\r", false);
+        let key =
+            |code, modifiers| encode_key(&KeyEvent::new(code, modifiers), b"\x1b\r", false, false);
         assert_eq!(
             key(KeyCode::Delete, KeyModifiers::NONE),
             Some(b"\x1b[3~".to_vec())
@@ -4339,8 +4566,14 @@ mod tests {
 
     #[test]
     fn function_keys_encode_to_tilde_codes() {
-        let key =
-            |n, modifiers| encode_key(&KeyEvent::new(KeyCode::F(n), modifiers), b"\x1b\r", false);
+        let key = |n, modifiers| {
+            encode_key(
+                &KeyEvent::new(KeyCode::F(n), modifiers),
+                b"\x1b\r",
+                false,
+                false,
+            )
+        };
         // F1–F4 and F5–F12 carry the standard xterm CSI-tilde codes.
         assert_eq!(key(1, KeyModifiers::NONE), Some(b"\x1b[11~".to_vec()));
         assert_eq!(key(4, KeyModifiers::NONE), Some(b"\x1b[14~".to_vec()));
