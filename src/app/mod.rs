@@ -219,21 +219,32 @@ pub struct SideState {
     pub visible: bool,
     pub width: u16,
     pub docks: Vec<DockKind>,
-    /// Relative height share per mounted dock, parallel to `docks`. Empty, or
-    /// stale after a dock was added or removed, means an equal split — see
-    /// [`SideState::dock_weights`].
+    /// Relative height share per mounted dock, parallel to `docks`. Empty means
+    /// an equal split. Topology changes go through [`SideState::push_dock`] /
+    /// [`SideState::remove_dock`], which keep this vector aligned by dock
+    /// identity — or clear it when it was already unusable — so a stale list
+    /// cannot be reassigned positionally. See [`SideState::dock_weights`].
     pub weights: Vec<u16>,
 }
 
 impl SideState {
+    /// Load a sidebar. Dock ids beyond [`MAX_DOCKS_PER_SIDE`] are dropped.
+    /// Weights are kept only when they already match the mounted docks
+    /// one-for-one and every share is positive; any other list (wrong length
+    /// after the cap truncation, or a zero) is discarded so it cannot be
+    /// reassigned to different docks.
     fn from_config(c: &crate::config::SideConfig) -> SideState {
         let mut docks: Vec<DockKind> = c.docks.iter().map(|s| DockKind::from_id(s)).collect();
         // Enforce the per-side cap on load: a hand-edited or pre-cap config with
         // more than `MAX_DOCKS_PER_SIDE` here keeps the first few; the overflow
         // falls to "off" (unmounted, still in the registry to re-place).
         docks.truncate(MAX_DOCKS_PER_SIDE);
-        let mut weights = c.dock_weights.clone();
-        weights.truncate(docks.len());
+        let weights =
+            if c.dock_weights.len() == docks.len() && c.dock_weights.iter().all(|w| *w > 0) {
+                c.dock_weights.clone()
+            } else {
+                Vec::new()
+            };
         SideState {
             visible: c.visible,
             width: c.width.clamp(SIDEBAR_WIDTH_MIN, SIDEBAR_WIDTH_MAX),
@@ -268,6 +279,46 @@ impl SideState {
     /// True if `kind` is mounted in this sidebar.
     pub fn has(&self, kind: &DockKind) -> bool {
         self.docks.contains(kind)
+    }
+
+    /// Remove every occurrence of `kind`, dropping the weight at the same
+    /// index when the two vectors still line up. A stale or mismatched weight
+    /// list is cleared instead of being left for a later positional truncate.
+    pub fn remove_dock(&mut self, kind: &DockKind) {
+        if self.weights.len() == self.docks.len() {
+            let mut i = 0;
+            while i < self.docks.len() {
+                if self.docks[i] == *kind {
+                    self.docks.remove(i);
+                    self.weights.remove(i);
+                } else {
+                    i += 1;
+                }
+            }
+        } else {
+            self.docks.retain(|d| d != kind);
+            self.weights.clear();
+        }
+    }
+
+    /// Append `kind`. When the existing weights already describe the mounted
+    /// docks, the new dock gets the rounded average of those shares (minimum 1)
+    /// so it opens at a fair size instead of a sliver. Empty or unusable
+    /// weights stay empty so [`SideState::dock_weights`] falls back to an even
+    /// split.
+    pub fn push_dock(&mut self, kind: DockKind) {
+        let append_weight = !self.weights.is_empty()
+            && self.weights.len() == self.docks.len()
+            && self.weights.iter().all(|w| *w > 0);
+        if append_weight {
+            let sum: u32 = self.weights.iter().map(|w| u32::from(*w)).sum();
+            let n = self.weights.len() as u32;
+            let avg = sum.saturating_add(n / 2).checked_div(n).unwrap_or(1).max(1) as u16;
+            self.weights.push(avg);
+        } else {
+            self.weights.clear();
+        }
+        self.docks.push(kind);
     }
 }
 
@@ -1322,8 +1373,7 @@ const SIDEBAR_GRAB_TOL: u16 = 2;
 /// Rows a dock keeps no matter how far its divider is dragged: enough for the
 /// header plus one line of content, so a dock can be made small but never
 /// squeezed into nothing the user then cannot grab back.
-const MIN_DOCK_HEIGHT: u16 = 3;
-
+pub(crate) const MIN_DOCK_HEIGHT: u16 = 3;
 impl Selection {
     /// (start, end) terminal cells in reading order (top-left → bottom-right).
     pub(crate) fn ordered(&self) -> ((u16, u16), (u16, u16)) {
@@ -1587,6 +1637,9 @@ pub struct App {
     pub catalog: &'static crate::i18n::Catalog,
     /// Persisted user configuration (theme, layout, notifications, keys).
     pub config: crate::config::Config,
+    /// This server's last local config snapshot. Persistence diffs against this
+    /// snapshot so another named server's newer, unrelated fields survive.
+    config_baseline: crate::config::Config,
     /// Active `key → Cmd` map for prefix mode (defaults + config overrides).
     pub keymap: std::collections::HashMap<String, Cmd>,
     /// Explicit normal-mode shortcuts. Empty by default so pane input remains
@@ -1676,7 +1729,6 @@ pub struct App {
     /// outlives its windows. Closing the last project replaces it with a neutral
     /// terminal rooted at `$HOME`; only `server stop` ends the server.
     pub server_mode: bool,
-    pub spinner: u64,
     /// Structure changed since the last save; the loop persists when set.
     pub session_dirty: bool,
     pub events: EventBus,
@@ -1739,6 +1791,11 @@ pub struct App {
     /// path (docs/54 MC-2/MC-4).
     pub agent_usage:
         std::collections::HashMap<crate::mission::UsageKey, crate::mission::AgentUsage>,
+    /// Entries whose exact session and counters came from a live integration.
+    /// Kept separately from native mtimes so a background native-store refresh
+    /// cannot erase or overwrite the stronger pane-local authority.
+    pub(crate) reported_usage:
+        std::collections::HashMap<crate::mission::UsageKey, crate::mission::ReportedUsage>,
     /// Each scanned transcript's mtime, so the next usage scan re-reads a session
     /// only when its file actually changed (docs/54) — an idle session costs one
     /// `stat`, not a full read+parse.
@@ -2135,6 +2192,7 @@ impl App {
         let name = ws_name(&cwd);
 
         let config = crate::config::load();
+        let config_baseline = config.clone();
         let files_show_hidden = config.layout.files_show_hidden;
         let agents_active_only = config.agents_active_only;
         crate::layout::set_gaps(config.layout.col_gap, config.layout.row_gap);
@@ -2207,6 +2265,7 @@ impl App {
             theme_registry,
             catalog,
             config,
+            config_baseline,
             keymap,
             direct_keymap,
             prefix,
@@ -2244,7 +2303,6 @@ impl App {
             zoomed: false,
             should_quit: false,
             server_mode: false,
-            spinner: 0,
             session_dirty: true,
             events: api::new_bus(),
             orch: crate::orch::OrchState::load(),
@@ -2273,6 +2331,7 @@ impl App {
             mission_burn: None,
             mission_last_cost: None,
             agent_usage: std::collections::HashMap::new(),
+            reported_usage: std::collections::HashMap::new(),
             usage_mtimes: std::collections::HashMap::new(),
             last_cursor: None,
             detach_requested: false,
@@ -2463,6 +2522,7 @@ impl App {
 
     fn from_snapshot(snap: SessionSnapshot, app_tx: Sender<AppEvent>) -> Option<App> {
         let config = crate::config::load();
+        let config_baseline = config.clone();
         let files_show_hidden = config.layout.files_show_hidden;
         let agents_active_only = config.agents_active_only;
         let theme_registry = crate::theme::ThemeRegistry::load();
@@ -2824,6 +2884,7 @@ impl App {
             theme_registry,
             catalog,
             config,
+            config_baseline,
             keymap,
             direct_keymap,
             prefix,
@@ -2861,7 +2922,6 @@ impl App {
             zoomed: false,
             should_quit: false,
             server_mode: false,
-            spinner: 0,
             session_dirty: false,
             events: api::new_bus(),
             orch: crate::orch::OrchState::load(),
@@ -2890,6 +2950,7 @@ impl App {
             mission_burn: None,
             mission_last_cost: None,
             agent_usage: std::collections::HashMap::new(),
+            reported_usage: std::collections::HashMap::new(),
             usage_mtimes: std::collections::HashMap::new(),
             last_cursor: None,
             detach_requested: false,
@@ -3132,7 +3193,30 @@ impl App {
     pub fn save_sidebars(&mut self) {
         self.config.sidebars = Some(self.sidebars.to_config());
         self.config.sidebar_width = self.sidebars.left.width;
-        crate::config::save(&self.config);
+        self.persist_config();
+    }
+
+    /// Merge only this server's local changes into the shared home-level config.
+    /// A failed best-effort write keeps the old baseline so the next mutation
+    /// retries every unsaved field.
+    pub(crate) fn persist_config(&mut self) {
+        if crate::config::save_changes(&self.config_baseline, &self.config) {
+            self.config_baseline = self.config.clone();
+        }
+    }
+
+    /// Persist local changes while forcing an explicit user/API patch even when
+    /// this server already held the requested value in memory.
+    pub(crate) fn persist_config_patch(&mut self, patch: &serde_json::Value) {
+        if crate::config::save_changes_with_patch(&self.config_baseline, &self.config, Some(patch))
+        {
+            self.config_baseline = self.config.clone();
+        }
+    }
+
+    /// Adopt an externally reloaded config without writing it back to disk.
+    pub(crate) fn reset_config_baseline(&mut self) {
+        self.config_baseline = self.config.clone();
     }
 
     /// Apply the AGENTS All / Active projection without performing I/O. This is
@@ -3154,7 +3238,7 @@ impl App {
         let config_changed = self.config.agents_active_only != active_only;
         if config_changed {
             self.config.agents_active_only = active_only;
-            crate::config::save(&self.config);
+            self.persist_config();
         }
         runtime_changed || config_changed
     }
@@ -3175,18 +3259,21 @@ impl App {
     /// the side. Placing a dock onto the side it already occupies is never "full".
     pub fn move_dock(&mut self, kind: &DockKind, target: Side) -> bool {
         let dst = self.sidebars.get(target);
-        if !dst.has(kind) && dst.docks.len() >= MAX_DOCKS_PER_SIDE {
+        // Already there: honour the no-op. Removing and re-appending would
+        // push the dock to the bottom of its stack and, now that weights
+        // follow dock identity, swap its share for the average of the rest.
+        if dst.has(kind) {
+            return true;
+        }
+        if dst.docks.len() >= MAX_DOCKS_PER_SIDE {
             let msg = self.catalog.sidebar_full;
             self.show_toast(msg);
             return false;
         }
         for side in [Side::Left, Side::Right] {
-            self.sidebars.get_mut(side).docks.retain(|d| d != kind);
+            self.sidebars.get_mut(side).remove_dock(kind);
         }
-        let dst = self.sidebars.get_mut(target);
-        if !dst.docks.contains(kind) {
-            dst.docks.push(kind.clone());
-        }
+        self.sidebars.get_mut(target).push_dock(kind.clone());
         if kind == &DockKind::Files {
             self.sidebars.files_side = target;
         }
@@ -3204,7 +3291,7 @@ impl App {
     /// registry and can be re-placed). Persists.
     pub fn unmount_dock(&mut self, kind: &DockKind) {
         for side in [Side::Left, Side::Right] {
-            self.sidebars.get_mut(side).docks.retain(|d| d != kind);
+            self.sidebars.get_mut(side).remove_dock(kind);
         }
         // Remember an explicit "off" for a module dock so its own `ui.dock.push`
         // (startup / `workspace.created` / a refresh) can't resurrect it on the
@@ -3326,7 +3413,7 @@ impl App {
         for id in ids {
             let kind = DockKind::Module(id.clone());
             for side in [Side::Left, Side::Right] {
-                self.sidebars.get_mut(side).docks.retain(|d| d != &kind);
+                self.sidebars.get_mut(side).remove_dock(&kind);
             }
             self.module_docks.remove(id);
         }
@@ -3334,14 +3421,6 @@ impl App {
     }
 
     // ── accessors ───────────────────────────────────────────────────────────
-
-    /// True if any pane is currently Working — drives the sidebar spinner and
-    /// how often the loop repaints to animate it.
-    pub fn any_working(&self) -> bool {
-        self.status
-            .values()
-            .any(|s| s.state == crate::ui::theme::State::Working)
-    }
 
     /// Re-arm every pane's PTY wake-coalescing flag (see `Pane.data_pending`),
     /// letting the readers announce fresh output again. Returns whether any
@@ -5744,7 +5823,12 @@ impl App {
         // The pair either side of this divider trade rows; the total they own
         // is fixed, so nothing below shifts.
         let pair = heights[index].saturating_add(heights[index + 1]);
-        let top = dividers[index];
+        // Below twice the floor there is no split that keeps both docks at it,
+        // and clamping only the first would push the second under. Refuse the
+        // drag instead of breaking the invariant.
+        if pair < MIN_DOCK_HEIGHT.saturating_mul(2) {
+            return;
+        }        let top = dividers[index];
         let start = top.saturating_sub(heights[index]);
         let want = r.saturating_sub(start);
         let max = pair.saturating_sub(MIN_DOCK_HEIGHT);
@@ -5771,8 +5855,7 @@ impl App {
             return Vec::new();
         };
         let mut heights = Vec::with_capacity(n);
-        let mut y = seam.y;
-        for i in 0..n {
+        let mut y = seam.y.saturating_add(crate::ui::SIDEBAR_CHROME_ROWS);        for i in 0..n {
             let end = dividers.get(i).copied().unwrap_or(seam.bottom());
             heights.push(end.saturating_sub(y));
             y = end.saturating_add(1);
@@ -5864,6 +5947,16 @@ impl App {
         self.backend_terminal_index.retain(|_, pane| *pane != id);
         self.backend_labels.remove(&id);
         self.cancel_backend_revision_waits(id);
+        let reported = self
+            .reported_usage
+            .iter()
+            .filter_map(|(key, owner)| (owner.pane == id).then_some(key.clone()))
+            .collect::<Vec<_>>();
+        for key in reported {
+            self.reported_usage.remove(&key);
+            self.agent_usage.remove(&key);
+            self.usage_mtimes.remove(&key);
+        }
         self.panes.remove(&id);
         self.status.remove(&id);
         self.views.remove(&id);
@@ -6294,6 +6387,17 @@ mod tests {
         app.active_ws = 0;
     }
 
+    fn api_call(app: &mut App, method: &str, params: serde_json::Value) -> serde_json::Value {
+        let (reply, _rx) = mpsc::channel();
+        serde_json::from_str(&app.handle_api(&ApiRequest {
+            id: "test".into(),
+            method: method.into(),
+            params,
+            reply,
+        }))
+        .unwrap()
+    }
+
     /// The new-pane cwd resolver hands back the chain of directories that still
     /// exist, in preference order, and never a directory it has already found
     /// missing. Regression for `spawn_cwd`'s old `unwrap_or(root)`, which
@@ -6572,6 +6676,34 @@ mod tests {
             restored.agents_active_only,
             "snapshot restoration reads config instead of snapshot state"
         );
+    }
+
+    #[test]
+    fn stale_named_app_change_does_not_restore_an_old_theme() {
+        let _env = crate::persist::test_env("named-app-config-merge");
+        let initial = crate::config::Config {
+            theme: "gruvbox-light".into(),
+            ..crate::config::Config::default()
+        };
+        crate::config::save(&initial);
+
+        let (alpha_tx, _alpha_rx) = mpsc::channel();
+        let (beta_tx, _beta_rx) = mpsc::channel();
+        let mut alpha = App::new(80, 24, alpha_tx).unwrap();
+        let mut beta = App::new(80, 24, beta_tx).unwrap();
+        assert_eq!(alpha.config.theme, "gruvbox-light");
+        assert_eq!(beta.config.theme, "gruvbox-light");
+
+        alpha.apply_theme("quattro-rally");
+        assert!(beta.set_agents_filter(true));
+
+        let merged = crate::config::load();
+        assert_eq!(merged.theme, "quattro-rally");
+        assert!(merged.agents_active_only);
+
+        let (restarted_tx, _restarted_rx) = mpsc::channel();
+        let restarted = App::new(80, 24, restarted_tx).unwrap();
+        assert_eq!(restarted.config.theme, "quattro-rally");
     }
 
     // A saved pane whose cwd no longer exists (deleted project dir) must not
@@ -7180,6 +7312,220 @@ mod tests {
             .unwrap();
         assert_eq!(sess.agent, "claude");
         assert_eq!(sess.session_id, "abc-123");
+    }
+
+    #[test]
+    fn reported_session_usage_is_validated_ordered_and_scan_safe() {
+        let _env = crate::persist::test_env("reported-session-usage");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        let valid = json!({
+            "pane": pane.0.to_string(),
+            "agent": "opencode",
+            "session_id": "ses_live",
+            "usage": {
+                "model": "anthropic/claude-sonnet-4",
+                "tokens_in": 1200,
+                "tokens_out": 340,
+                "cache_read": 800,
+                "cache_write": 40,
+                "cost": 0.42,
+                "updated_at": 1000
+            }
+        });
+        let response = api_call(&mut app, "pane.report_session", valid);
+        assert_eq!(response["result"]["type"], "ok");
+
+        let key = crate::mission::UsageKey::new("opencode", "ses_live");
+        let usage = app.agent_usage.get(&key).unwrap();
+        assert_eq!(
+            (usage.tokens_in, usage.tokens_out, usage.cache),
+            (1200, 340, 840)
+        );
+        assert_eq!(usage.cost, Some(0.42));
+        assert_eq!(app.reported_usage[&key].pane, pane);
+
+        let mut stale = json!({
+            "pane": pane.0.to_string(), "agent": "opencode", "session_id": "ses_live",
+            "usage": {
+                "model": "wrong", "tokens_in": 1, "tokens_out": 1,
+                "cache_read": 0, "cache_write": 0, "cost": 1.0, "updated_at": 999
+            }
+        });
+        let response = api_call(&mut app, "pane.report_session", stale.clone());
+        assert_eq!(response["error"]["code"], "stale_report");
+        assert_eq!(app.agent_usage[&key].tokens_in, 1200);
+
+        stale["usage"]["tokens_in"] = json!(1.5);
+        stale["usage"]["updated_at"] = json!(1001);
+        let response = api_call(&mut app, "pane.report_session", stale);
+        assert_eq!(response["error"]["code"], "invalid_request");
+        assert_eq!(app.agent_usage[&key].tokens_in, 1200);
+
+        app.handle_event(crate::event::AppEvent::UsageScanned {
+            scope: crate::mission::MissionScope::All,
+            scanned: vec![key.clone()],
+            usage: std::collections::HashMap::new(),
+            mtimes: std::collections::HashMap::new(),
+            report_owned: vec![key.clone()],
+        });
+        assert_eq!(app.agent_usage[&key].tokens_in, 1200);
+
+        let response = api_call(
+            &mut app,
+            "pane.report_session",
+            json!({"pane":pane.0.to_string(),"agent":"opencode","session_id":"ses_next"}),
+        );
+        assert_eq!(response["result"]["type"], "ok");
+        assert!(!app.agent_usage.contains_key(&key));
+        assert!(!app.reported_usage.contains_key(&key));
+    }
+
+    #[test]
+    fn late_native_scan_cannot_reclassify_removed_reported_usage() {
+        let _env = crate::persist::test_env("reported-session-late-scan");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        let old = crate::mission::UsageKey::new("opencode", "ses_old");
+        let response = api_call(
+            &mut app,
+            "pane.report_session",
+            json!({
+                "pane": pane.0.to_string(),
+                "agent": "opencode",
+                "session_id": "ses_old",
+                "usage": {
+                    "model": "openai/gpt-5",
+                    "tokens_in": 100,
+                    "tokens_out": 20,
+                    "cache_read": 5,
+                    "cache_write": 1,
+                    "cost": 0.01,
+                    "updated_at": 100
+                }
+            }),
+        );
+        assert_eq!(response["result"]["type"], "ok");
+        let stale = app.agent_usage[&old].clone();
+
+        let response = api_call(
+            &mut app,
+            "pane.report_session",
+            json!({
+                "pane": pane.0.to_string(),
+                "agent": "opencode",
+                "session_id": "ses_new"
+            }),
+        );
+        assert_eq!(response["result"]["type"], "ok");
+        assert!(!app.reported_usage.contains_key(&old));
+
+        app.handle_event(crate::event::AppEvent::UsageScanned {
+            scope: crate::mission::MissionScope::All,
+            scanned: vec![old.clone()],
+            usage: [(old.clone(), stale)].into(),
+            mtimes: [(old.clone(), std::time::SystemTime::UNIX_EPOCH)].into(),
+            report_owned: vec![old.clone()],
+        });
+        assert!(!app.agent_usage.contains_key(&old));
+        assert!(!app.usage_mtimes.contains_key(&old));
+    }
+
+    #[test]
+    fn reported_session_rejects_unknown_fields_agents_and_unsafe_ids_without_mutation() {
+        let _env = crate::persist::test_env("reported-session-invalid");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        for params in [
+            json!({"pane":pane.0.to_string(),"agent":"claude","session_id":"ok","extra":true}),
+            json!({"pane":pane.0.to_string(),"agent":"manifest-only","session_id":"ok"}),
+            json!({"pane":pane.0.to_string(),"agent":"claude","session_id":"unsafe id"}),
+            json!({"pane":pane.0.to_string(),"agent":"claude","session_id":""}),
+        ] {
+            let response = api_call(&mut app, "pane.report_session", params);
+            assert!(
+                response.get("error").is_some(),
+                "unexpected response: {response}"
+            );
+            assert!(app.status[&pane].agent_session.is_none());
+        }
+    }
+
+    #[test]
+    fn reported_session_has_one_owner_and_closing_that_pane_prunes_its_usage() {
+        let _env = crate::persist::test_env("reported-session-owner");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.run_cmd(crate::app::keys::Cmd::SplitRight);
+        let panes = app.layout().leaves();
+        assert_eq!(panes.len(), 2);
+        let owner = panes[0];
+        let other = panes[1];
+        let payload = |pane: PaneId| {
+            json!({
+                "pane": pane.0.to_string(),
+                "agent": "opencode",
+                "session_id": "ses_owned",
+                "usage": {
+                    "model": "openai/gpt-5",
+                    "tokens_in": 10,
+                    "tokens_out": 5,
+                    "cache_read": 2,
+                    "cache_write": 1,
+                    "cost": 0.01,
+                    "updated_at": 100
+                }
+            })
+        };
+
+        assert_eq!(
+            api_call(&mut app, "pane.report_session", payload(owner))["result"]["type"],
+            "ok"
+        );
+        let key = crate::mission::UsageKey::new("opencode", "ses_owned");
+        let rejected = api_call(&mut app, "pane.report_session", payload(other));
+        assert_eq!(rejected["error"]["code"], "conflict");
+        assert_eq!(app.reported_usage[&key].pane, owner);
+        assert!(app.status[&other].agent_session.is_none());
+
+        app.close_pane(owner);
+        assert!(!app.reported_usage.contains_key(&key));
+        assert!(!app.agent_usage.contains_key(&key));
+    }
+
+    #[test]
+    fn reported_usage_uses_the_same_pricing_override_as_native_usage() {
+        let _env = crate::persist::test_env("reported-session-pricing");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.config
+            .mission_pricing
+            .insert("custom-model".to_string(), [2.0, 8.0, 1.0]);
+        let pane = app.layout().focus;
+        let response = api_call(
+            &mut app,
+            "pane.report_session",
+            json!({
+                "pane": pane.0.to_string(),
+                "agent": "opencode",
+                "session_id": "ses_priced",
+                "usage": {
+                    "model": "provider/custom-model-v1",
+                    "tokens_in": 1_000_000,
+                    "tokens_out": 1_000_000,
+                    "cache_read": 1_000_000,
+                    "cache_write": 0,
+                    "cost": 999.0,
+                    "updated_at": 100
+                }
+            }),
+        );
+        assert_eq!(response["result"]["type"], "ok");
+        let key = crate::mission::UsageKey::new("opencode", "ses_priced");
+        assert_eq!(app.agent_usage[&key].cost, Some(11.0));
     }
 
     #[test]
@@ -8987,6 +9333,128 @@ mod tests {
         );
     }
 
+    /// Removing a dock drops the weight at the same index; a config round-trip
+    /// keeps that identity mapping instead of truncating positionally.
+    #[test]
+    fn removing_a_dock_keeps_sibling_weights_and_round_trips() {
+        let mut side = SideState {
+            visible: true,
+            width: 30,
+            docks: vec![DockKind::Workspaces, DockKind::Agents, DockKind::Files],
+            weights: vec![5, 3, 2],
+        };
+        side.remove_dock(&DockKind::Agents);
+        assert_eq!(
+            side.docks,
+            vec![DockKind::Workspaces, DockKind::Files],
+            "the middle dock is gone"
+        );
+        assert_eq!(side.weights, vec![5, 2], "its neighbours keep their shares");
+
+        let loaded = SideState::from_config(&side.to_config());
+        assert_eq!(loaded.docks, side.docks);
+        assert_eq!(loaded.weights, side.weights);
+    }
+
+    /// A persisted weight list of the wrong length is discarded, not truncated
+    /// onto whichever docks happen to remain.
+    #[test]
+    fn from_config_discards_a_weight_list_of_the_wrong_length() {
+        let cfg = crate::config::SideConfig {
+            visible: true,
+            width: 30,
+            docks: vec!["workspaces".into(), "agents".into()],
+            dock_weights: vec![5, 3, 2],
+        };
+        let side = SideState::from_config(&cfg);
+        assert!(
+            side.weights.is_empty(),
+            "stale weights are not kept: {:?}",
+            side.weights
+        );
+        assert_eq!(
+            side.dock_weights(),
+            vec![1, 1],
+            "the even-split fallback applies"
+        );
+    }
+
+    /// A newly mounted dock on a weighted side gets the rounded average of the
+    /// existing shares, not a leftover sliver.
+    #[test]
+    fn mounting_a_dock_appends_the_rounded_average_weight() {
+        let mut side = SideState {
+            visible: true,
+            width: 30,
+            docks: vec![DockKind::Workspaces, DockKind::Agents],
+            weights: vec![5, 3],
+        };
+        side.push_dock(DockKind::Files);
+        assert_eq!(
+            side.docks,
+            vec![DockKind::Workspaces, DockKind::Agents, DockKind::Files]
+        );
+        assert_eq!(
+            side.weights,
+            vec![5, 3, 4],
+            "the new dock gets round((5+3)/2) = 4"
+        );
+    }
+
+    /// Moving a dock to the other side keeps the source weights aligned with
+    /// the docks that stayed, and the destination receives the dock without
+    /// inheriting a positional leftover.
+    #[test]
+    fn move_dock_keeps_remaining_weights_aligned_on_both_sides() {
+        let _env = crate::persist::test_env("dock-move-weights");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        app.sidebars.left.docks = vec![DockKind::Workspaces, DockKind::Agents, DockKind::Files];
+        app.sidebars.left.weights = vec![5, 3, 2];
+        app.sidebars.right.docks = Vec::new();
+        app.sidebars.right.weights = Vec::new();
+
+        assert!(app.move_dock(&DockKind::Agents, Side::Right));
+        assert_eq!(
+            app.sidebars.left.docks,
+            vec![DockKind::Workspaces, DockKind::Files]
+        );
+        assert_eq!(
+            app.sidebars.left.weights,
+            vec![5, 2],
+            "source keeps the weights of the docks that stayed"
+        );
+        assert_eq!(app.sidebars.right.docks, vec![DockKind::Agents]);
+        assert!(
+            app.sidebars.right.weights.is_empty(),
+            "empty destination stays on the even-split fallback: {:?}",
+            app.sidebars.right.weights
+        );
+        assert_eq!(app.sidebars.right.dock_weights(), vec![1]);
+    }
+
+    /// Moving a dock onto the side it already occupies is the documented
+    /// no-op: its position in the stack and its share must both survive.
+    #[test]
+    fn move_dock_onto_its_own_side_keeps_order_and_weights() {
+        let _env = crate::persist::test_env("dock-move-same-side");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        app.sidebars.left.docks = vec![DockKind::Workspaces, DockKind::Agents, DockKind::Files];
+        app.sidebars.left.weights = vec![5, 3, 2];
+
+        assert!(app.move_dock(&DockKind::Agents, Side::Left));
+        assert_eq!(
+            app.sidebars.left.docks,
+            vec![DockKind::Workspaces, DockKind::Agents, DockKind::Files],
+            "the dock stays where it was, not at the bottom"
+        );
+        assert_eq!(
+            app.sidebars.left.weights,
+            vec![5, 3, 2],
+            "its share is untouched"
+        );
+    }
     /// Dragging a divider moves the boundary between the two docks it separates
     /// and leaves the rest of the sidebar alone. Neither side can be squeezed
     /// past `MIN_DOCK_HEIGHT`, so a dock can always be grabbed back.
@@ -8998,9 +9466,9 @@ mod tests {
 
         app.sidebars.left.docks = vec![DockKind::Workspaces, DockKind::Agents];
         app.sidebars.left.weights = Vec::new();
-        // Stand in for a frame: a 30-row sidebar split evenly, so the rule
-        // between the two docks sits at row 15.
-        app.left_seam = Some(Rect::new(29, 0, 1, 30));
+        // Stand in for a frame: a 30-row sidebar whose two chrome rows sit
+        // above the dock body. The pair owns 27 rows (chrome plus the divider
+        // itself take the rest); the rule sits at row 15.        app.left_seam = Some(Rect::new(29, 0, 1, 30));
         app.dock_dividers = vec![(Side::Left, 0, 15)];
 
         app.dock_resize = Some((Side::Left, 0));
@@ -9013,8 +9481,7 @@ mod tests {
         );
         assert_eq!(
             weights[0] + weights[1],
-            29,
-            "the pair's combined rows are conserved"
+            27,            "the pair's combined rows are conserved"
         );
 
         // Far past the top: the upper dock stops at the floor instead of vanishing.
@@ -9023,7 +9490,205 @@ mod tests {
             app.sidebars.left.weights[0], MIN_DOCK_HEIGHT,
             "the upper dock keeps its floor"
         );
+        // ...and the other one never falls under it either.
+        assert!(
+            app.sidebars.left.weights[1] >= MIN_DOCK_HEIGHT,
+            "the lower dock keeps its floor too: {:?}",
+            app.sidebars.left.weights
+        );
     }
+
+    /// A pair with fewer rows than two floors cannot be split without pushing
+    /// one dock under the minimum, so the drag must decline rather than
+    /// produce a dock the user can no longer grab.
+    #[test]
+    fn a_pair_too_small_for_two_floors_refuses_the_drag() {
+        let _env = crate::persist::test_env("dock-divider-too-small");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 40, tx).unwrap();
+
+        app.sidebars.left.docks = vec![DockKind::Workspaces, DockKind::Agents];
+        app.sidebars.left.weights = Vec::new();
+        // Five rows for two docks: 2 * MIN_DOCK_HEIGHT would need six.
+        app.left_seam = Some(Rect::new(29, 0, 1, 5));
+        app.dock_dividers = vec![(Side::Left, 0, 2)];
+
+        app.dock_resize = Some((Side::Left, 0));
+        app.update_dock_resize(10, 4);
+        assert!(
+            app.sidebars.left.weights.is_empty(),
+            "no split was written: {:?}",
+            app.sidebars.left.weights
+        );
+    }
+
+    /// Dragging a rendered divider by exactly one row must move that published
+    /// rule by one row, not jump, and must conserve the pair's combined height.
+    /// Fails while `dock_heights` measures from the seam origin (chrome rows
+    /// inflate the first dock) and passes once it starts at the dock body.
+    #[test]
+    fn dragging_a_rendered_dock_divider_by_one_row_moves_it_exactly_one_row() {
+        let _env = crate::persist::test_env("dock-divider-one-row");
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 40, tx).unwrap();
+        app.sidebars.left.docks = vec![DockKind::Workspaces, DockKind::Agents];
+        app.sidebars.left.visible = true;
+        app.sidebars.left.weights = Vec::new();
+
+        let mut term = Terminal::new(TestBackend::new(80, 40)).unwrap();
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+
+        let dy = app
+            .dock_dividers
+            .iter()
+            .find(|(side, _, _)| *side == Side::Left)
+            .map(|(_, _, y)| *y)
+            .expect("two stacked docks publish a left divider");
+        let col = app
+            .left_seam
+            .expect("left sidebar is shown")
+            .x
+            .saturating_sub(1);
+        let sum_before: u16 = app.dock_heights(Side::Left).iter().sum();
+        assert!(
+            sum_before > 0,
+            "rendered docks have a measurable pair: {:?}",
+            app.dock_heights(Side::Left)
+        );
+
+        assert!(
+            app.begin_dock_resize(col, dy),
+            "the published divider is a hit target"
+        );
+        app.update_dock_resize(col, dy + 1);
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        let down = app
+            .dock_dividers
+            .iter()
+            .find(|(side, _, _)| *side == Side::Left)
+            .map(|(_, _, y)| *y)
+            .expect("divider still published after a one-row drag down");
+        assert_eq!(down, dy + 1, "the rule moved down by exactly one row");
+        assert_eq!(
+            app.dock_heights(Side::Left).iter().sum::<u16>(),
+            sum_before,
+            "the pair's combined rows are conserved after dragging down"
+        );
+
+        app.sidebars.left.weights = Vec::new();
+        app.end_dock_resize();
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        let reset = app
+            .dock_dividers
+            .iter()
+            .find(|(side, _, _)| *side == Side::Left)
+            .map(|(_, _, y)| *y)
+            .expect("even split republishes a divider");
+        assert_eq!(reset, dy, "clearing weights restores the original split");
+
+        assert!(app.begin_dock_resize(col, dy));
+        app.update_dock_resize(col, dy - 1);
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        let up = app
+            .dock_dividers
+            .iter()
+            .find(|(side, _, _)| *side == Side::Left)
+            .map(|(_, _, y)| *y)
+            .expect("divider still published after a one-row drag up");
+        assert_eq!(up, dy - 1, "the rule moved up by exactly one row");
+        assert_eq!(
+            app.dock_heights(Side::Left).iter().sum::<u16>(),
+            sum_before,
+            "the pair's combined rows are conserved after dragging up"
+        );
+    }
+
+    /// Three stacked docks: dragging one divider must not resize the dock that
+    /// is not in the pair, the divider must follow the cursor by one row, and
+    /// a second render must not drift. Covers both dividers.
+    #[test]
+    fn dragging_one_of_three_dock_dividers_leaves_the_untouched_dock_still() {
+        let _env = crate::persist::test_env("dock-divider-three");
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 40, tx).unwrap();
+        app.sidebars.left.docks = vec![DockKind::Workspaces, DockKind::Agents, DockKind::Files];
+        app.sidebars.left.visible = true;
+        app.sidebars.left.weights = Vec::new();
+
+        let mut term = Terminal::new(TestBackend::new(80, 40)).unwrap();
+        let col = {
+            term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+            app.left_seam
+                .expect("left sidebar is shown")
+                .x
+                .saturating_sub(1)
+        };
+
+        for index in 0..2 {
+            app.sidebars.left.weights = Vec::new();
+            app.end_dock_resize();
+            term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+
+            let before = app.dock_heights(Side::Left);
+            assert_eq!(before.len(), 3, "three docks after even split: {before:?}");
+            let dy = app
+                .dock_dividers
+                .iter()
+                .find(|(side, i, _)| *side == Side::Left && *i == index)
+                .map(|(_, _, y)| *y)
+                .unwrap_or_else(|| panic!("divider {index} is published"));
+            let untouched = if index == 0 { 2 } else { 0 };
+
+            assert!(
+                app.begin_dock_resize(col, dy),
+                "divider {index} is a hit target"
+            );
+            app.update_dock_resize(col, dy + 1);
+            term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+
+            let after = app.dock_heights(Side::Left);
+            assert_eq!(
+                after[untouched], before[untouched],
+                "divider {index}: dock {untouched} is not in the pair: before={before:?} after={after:?}"
+            );
+            assert_eq!(
+                after[index].saturating_add(after[index + 1]),
+                before[index].saturating_add(before[index + 1]),
+                "divider {index}: the pair's rows are conserved: before={before:?} after={after:?}"
+            );
+            let moved = app
+                .dock_dividers
+                .iter()
+                .find(|(side, i, _)| *side == Side::Left && *i == index)
+                .map(|(_, _, y)| *y)
+                .unwrap_or_else(|| panic!("divider {index} still published after the drag"));
+            assert_eq!(
+                moved,
+                dy + 1,
+                "divider {index} followed the cursor by exactly one row"
+            );
+
+            term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+            let again = app.dock_heights(Side::Left);
+            assert_eq!(
+                again, after,
+                "divider {index}: a second render must not drift: {after:?} -> {again:?}"
+            );
+            let still = app
+                .dock_dividers
+                .iter()
+                .find(|(side, i, _)| *side == Side::Left && *i == index)
+                .map(|(_, _, y)| *y)
+                .unwrap_or_else(|| panic!("divider {index} still published after a second render"));
+            assert_eq!(
+                still, moved,
+                "divider {index} must not walk on a second render"
+            );
+        }    }
 
     /// the invariant the WORKSPACES-vs-FILES bug violated; it now covers every
     /// dock geometry field at once, so a future dock can't reintroduce it.
@@ -10639,8 +11304,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    // A working agent shows an animated rotating-circle spinner in the AGENTS
-    // list dot slot (not the static `●`), advancing with `App.spinner`.
     // Clicking a pane's title opens the running-command overlay. The point is
     // that the command comes from the OS, not the screen: an agent's own UI
     // elides long commands and those characters never reach luvus at all.
@@ -10700,10 +11363,10 @@ mod tests {
     }
 
     #[test]
-    fn working_agent_shows_spinner() {
+    fn working_agent_shows_filled_status() {
         use ratatui::{backend::TestBackend, Terminal};
         // Isolate `$LUVUS_HOME`: with the developer's real config a different
-        // dock layout can push the AGENTS rows out of view, so the spinner is
+        // dock layout can push the AGENTS rows out of view, so the status is
         // never drawn and this fails depending on test order.
         let _env = crate::persist::test_env("spinner");
         let (tx, _rx) = std::sync::mpsc::channel();
@@ -10714,27 +11377,21 @@ mod tests {
         ps.state = crate::ui::theme::State::Working;
         app.status.insert(pid, ps);
 
-        // Take the frame set from the theme rather than hardcoding glyphs, so
-        // changing the spinner's look never silently breaks this test.
-        let frames: Vec<&str> = (0..crate::ui::theme::SPINNER_FRAMES)
-            .map(crate::ui::theme::spinner_frame)
-            .collect();
-        let frame_at = |app: &mut App, spin: u64| -> String {
-            app.spinner = spin;
-            let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
-            term.draw(|f| crate::ui::render(f, app)).unwrap();
-            let buf = term.backend().buffer().clone();
-            // The dot is the first glyph of the agent row inside the sidebar.
-            (0..buf.area.height)
-                .flat_map(|r| (0..buf.area.width).map(move |c| (c, r)))
-                .filter_map(|(c, r)| buf.cell((c, r)).map(|x| x.symbol().to_string()))
-                .find(|s| frames.contains(&s.as_str()))
-                .unwrap_or_default()
-        };
-        let f0 = frame_at(&mut app, 0);
-        let f1 = frame_at(&mut app, 1);
-        assert!(!f0.is_empty(), "a working agent shows a spinner glyph");
-        assert_ne!(f0, f1, "the spinner advances with app.spinner");
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let rows = (0..buf.area.height)
+            .map(|r| {
+                (0..buf.area.width)
+                    .map(|c| buf.cell((c, r)).map(|cell| cell.symbol()).unwrap_or(" "))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("● working") && row.contains("claude")),
+            "a working agent shows a static filled status marker"
+        );
     }
 
     // An agent that finishes a working stretch (Working → Idle) queues the
@@ -11367,6 +12024,7 @@ mod tests {
             )]
             .into(),
             mtimes: [(first.clone(), refreshed)].into(),
+            report_owned: Vec::new(),
         });
         assert_eq!(app.agent_usage[&first].tokens_in, 3);
         assert_eq!(app.agent_usage[&second].tokens_in, 2);
@@ -11382,6 +12040,7 @@ mod tests {
             scanned: vec![first.clone()],
             usage: [(first.clone(), app.agent_usage[&first].clone())].into(),
             mtimes: [(first.clone(), refreshed)].into(),
+            report_owned: Vec::new(),
         });
         assert!(app.agent_usage.contains_key(&first));
         assert!(!app.agent_usage.contains_key(&second));

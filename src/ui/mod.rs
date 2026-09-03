@@ -27,21 +27,6 @@ pub struct RenderTarget<'a> {
     area: Rect,
     cursor: Option<(u16, u16)>,
     cursor_visible: bool,
-    animation_mask: AnimationMask,
-}
-
-/// Allocation-free record of animated surfaces that were actually drawn into a
-/// client projection. The server uses this instead of global agent state, which
-/// avoids repainting when every working indicator is clipped or hidden.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct AnimationMask(u8);
-
-impl AnimationMask {
-    const WORKING_SPINNER: u8 = 1 << 0;
-
-    pub fn has_working_spinner(self) -> bool {
-        self.0 & Self::WORKING_SPINNER != 0
-    }
 }
 
 impl<'a> RenderTarget<'a> {
@@ -52,7 +37,6 @@ impl<'a> RenderTarget<'a> {
             area,
             cursor: None,
             cursor_visible: false,
-            animation_mask: AnimationMask::default(),
         }
     }
     pub fn area(&self) -> Rect {
@@ -79,15 +63,6 @@ impl<'a> RenderTarget<'a> {
     pub fn cursor_visible(&self) -> bool {
         self.cursor_visible
     }
-
-    /// Mark that this projection contains a live working-state spinner.
-    pub fn mark_working_animation(&mut self) {
-        self.animation_mask.0 |= AnimationMask::WORKING_SPINNER;
-    }
-
-    pub fn animation_mask(&self) -> AnimationMask {
-        self.animation_mask
-    }
 }
 
 mod board;
@@ -108,6 +83,7 @@ mod search;
 mod session_menu;
 mod settings;
 mod sidebar;
+pub(crate) use sidebar::SIDEBAR_CHROME_ROWS;
 mod status;
 pub(crate) mod switcher;
 mod tabbar;
@@ -122,7 +98,6 @@ pub fn render(f: &mut Frame, app: &mut App) {
             area,
             cursor: None,
             cursor_visible: false,
-            animation_mask: AnimationMask::default(),
         };
         render_into(&mut target, app);
         (target.cursor, target.cursor_visible)
@@ -193,6 +168,7 @@ pub fn render_projection(f: &mut RenderTarget, app: &mut App) {
     let diff_note_rects = std::mem::take(&mut app.diff_note_rects);
     let preview_link_rects = std::mem::take(&mut app.preview_link_rects);
     let module_dock_rects = std::mem::take(&mut app.module_dock_rects);
+    let dock_dividers = std::mem::take(&mut app.dock_dividers);
     let picker_rects = std::mem::take(&mut app.picker_rects);
     let settings_tab_rects = std::mem::take(&mut app.settings_tab_rects);
     let settings_ctl_rects = std::mem::take(&mut app.settings_ctl_rects);
@@ -331,6 +307,7 @@ pub fn render_projection(f: &mut RenderTarget, app: &mut App) {
     app.diff_note_rects = diff_note_rects;
     app.preview_link_rects = preview_link_rects;
     app.module_dock_rects = module_dock_rects;
+    app.dock_dividers = dock_dividers;
     app.picker_rects = picker_rects;
     app.settings_tab_rects = settings_tab_rects;
     app.settings_ctl_rects = settings_ctl_rects;
@@ -417,6 +394,65 @@ pub fn render_projection(f: &mut RenderTarget, app: &mut App) {
     }
 }
 
+/// Whether a PTY-only frame may reuse the active client's complete UI buffer.
+/// Every state that draws over pane content or changes terminal styling forces
+/// the ordinary full renderer. Conservative false negatives cost one full
+/// frame; a false positive could corrupt visible output.
+pub(crate) fn retained_pty_eligible(app: &App) -> bool {
+    app.mode == Mode::Normal
+        // OSC title changes arrive with PTY output and can alter an agent row
+        // outside the pane. Until retained chrome has its own invalidation,
+        // keep that optional projection on the full path.
+        && !app.config.layout.agent_title
+        && app.selection.is_none()
+        && app.copy_mode.is_none()
+        && app.hover_link.is_none()
+        && app.search_flash.is_none()
+        && app.settings.is_none()
+        && app.picker.is_none()
+        && !app.help_open
+        && !app.changelog_open
+        && app.cmd_inspect.is_none()
+        && app.worktree_prompt.is_none()
+        && app.tab_rename.is_none()
+        && app.tab_menu.is_none()
+        && app.ws_rename.is_none()
+        && app.pane_rename.is_none()
+        && app.ws_menu.is_none()
+        && app.pane_menu.is_none()
+        && app.agent_menu.is_none()
+        && app.file_menu.is_none()
+        && app.diff_menu.is_none()
+        && app.orch_menu.is_none()
+        && app.dock_menu.is_none()
+        && app.file_prompt.is_none()
+        && app.file_delete.is_none()
+        && app.worktree_delete.is_none()
+        && !app.switcher
+        && app.named_session_menu.is_none()
+        && app.search.is_none()
+        && app.orch_form.is_none()
+        && app.orch_start.is_none()
+        && app.orch_detail.is_none()
+        && app.mission_detail.is_none()
+        && app.mission_answer.is_none()
+        && app.bar.overflow.is_none()
+        && app.toast.is_none()
+        && !app.active_is_git()
+        && !app.active_is_orch()
+        && !app.active_is_mission()
+}
+
+/// Apply owned VT damage to an already complete active-client projection.
+pub(crate) fn patch_terminal_damage(
+    target: &mut RenderTarget,
+    app: &App,
+    content_rects: &[(PaneId, Rect)],
+    snapshots: &std::collections::HashMap<PaneId, crate::terminal::vt::DamageSnapshot>,
+) -> Result<(), ()> {
+    panes::patch_terminal_damage(target, app, content_rects, snapshots)
+}
+
 fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
     let t = app.theme.clone();
     // The active i18n catalog (Copy `&'static`), passed to draw fns that don't
@@ -429,6 +465,10 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
     app.menu_scroll.begin_frame();
     app.mission_row_rects.clear();
     app.orch_hits.clear();
+    // Cleared with the other per-frame hit geometry, above every early return:
+    // a frame that bails out (window too small, no workspace yet) must not
+    // leave a dock divider behind as a live drag target.
+    app.dock_dividers.clear();
     app.mobile_pane_prev_rect = None;
     app.mobile_pane_next_rect = None;
 
@@ -938,6 +978,7 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
     }
 
     let cursor = if settings_hits.is_some()
+        || app.search.is_some()
         || picker_open
         || app.bar.overflow.is_some()
         || app.help_open
@@ -1223,6 +1264,155 @@ fn short_path(p: &Path, max: u16) -> String {
 }
 
 #[cfg(test)]
+mod retained_render_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::mpsc;
+
+    use crate::terminal::appearance::PaneAppearance;
+    use crate::terminal::vt::{create_engine, VtEngineKind};
+
+    #[test]
+    fn damaged_rows_match_a_forced_full_projection() {
+        let _env = crate::persist::test_env("retained-render-equivalence");
+        let (app_tx, _app_rx) = mpsc::channel();
+        let mut app = App::new(100, 30, app_tx).expect("app starts");
+        let focus = app.layout().focus;
+        let (response_tx, _response_rx) = mpsc::channel();
+        let engine = create_engine(
+            VtEngineKind::Alacritty,
+            100,
+            30,
+            response_tx,
+            4 * 1024 * 1024,
+            PaneAppearance::default(),
+        );
+        app.panes.get_mut(&focus).expect("focused pane").engine = engine.clone();
+
+        {
+            let mut engine = engine.lock().expect("engine lock");
+            engine.advance("hello 界\r\nsecond line".as_bytes());
+        }
+        let area = Rect::new(0, 0, 100, 30);
+        let mut retained = Buffer::empty(area);
+        let mut initial_target = RenderTarget::new(&mut retained, area);
+        render_into(&mut initial_target, &mut app);
+        let content_rects = app.pane_content_rects.clone();
+        {
+            let mut engine = engine.lock().expect("engine lock");
+            let initial = engine.damage_snapshot();
+            assert!(engine.acknowledge_damage(initial.generation));
+            engine.recycle_damage_snapshot(initial);
+            engine.advance(b"\rA\x1b[K");
+        }
+        let snapshot = engine.lock().expect("engine lock").damage_snapshot();
+        assert_eq!(snapshot.kind, crate::terminal::vt::DamageKind::Partial);
+        let snapshots = HashMap::from([(focus, snapshot)]);
+
+        let partial_cursor = {
+            let mut target = RenderTarget::new(&mut retained, area);
+            patch_terminal_damage(&mut target, &app, &content_rects, &snapshots)
+                .expect("partial projection eligible");
+            (target.cursor(), target.cursor_visible())
+        };
+
+        let mut forced = Buffer::empty(area);
+        let full_cursor = {
+            let mut target = RenderTarget::new(&mut forced, area);
+            render_into(&mut target, &mut app);
+            (target.cursor(), target.cursor_visible())
+        };
+        assert_eq!(retained, forced);
+        assert_eq!(partial_cursor, full_cursor);
+        let snapshot = snapshots.into_values().next().expect("damage snapshot");
+        engine
+            .lock()
+            .expect("engine lock")
+            .recycle_damage_snapshot(snapshot);
+    }
+
+    /// Projection-only evidence for docs/115. Ignored in the ordinary suite
+    /// because wall-clock ratios are machine dependent; run in release mode.
+    #[test]
+    #[ignore]
+    fn retained_projection_benchmark() {
+        let _env = crate::persist::test_env("retained-render-benchmark");
+        let (app_tx, _app_rx) = mpsc::channel();
+        let mut app = App::new(160, 40, app_tx).expect("app starts");
+        let focus = app.layout().focus;
+        let (response_tx, _response_rx) = mpsc::channel();
+        let engine = create_engine(
+            VtEngineKind::Alacritty,
+            160,
+            40,
+            response_tx,
+            4 * 1024 * 1024,
+            PaneAppearance::default(),
+        );
+        app.panes.get_mut(&focus).expect("focused pane").engine = engine.clone();
+        let area = Rect::new(0, 0, 160, 40);
+        let mut retained = Buffer::empty(area);
+        let mut target = RenderTarget::new(&mut retained, area);
+        render_into(&mut target, &mut app);
+        let content_rects = app.pane_content_rects.clone();
+        let initial = engine.lock().expect("engine lock").damage_snapshot();
+        assert!(engine
+            .lock()
+            .expect("engine lock")
+            .acknowledge_damage(initial.generation));
+        engine
+            .lock()
+            .expect("engine lock")
+            .recycle_damage_snapshot(initial);
+
+        const ITERATIONS: usize = 2_000;
+        let partial_started = std::time::Instant::now();
+        for index in 0..ITERATIONS {
+            engine
+                .lock()
+                .expect("engine lock")
+                .advance(format!("\rrow {index:04}").as_bytes());
+            let snapshot = engine.lock().expect("engine lock").damage_snapshot();
+            let generation = snapshot.generation;
+            let snapshots = HashMap::from([(focus, snapshot)]);
+            let mut target = RenderTarget::new(&mut retained, area);
+            patch_terminal_damage(&mut target, &app, &content_rects, &snapshots).unwrap();
+            assert!(engine
+                .lock()
+                .expect("engine lock")
+                .acknowledge_damage(generation));
+            let snapshot = snapshots.into_values().next().expect("damage snapshot");
+            engine
+                .lock()
+                .expect("engine lock")
+                .recycle_damage_snapshot(snapshot);
+            std::hint::black_box(target.cursor());
+        }
+        let partial = partial_started.elapsed();
+
+        let mut forced = Buffer::empty(area);
+        let full_started = std::time::Instant::now();
+        for index in 0..ITERATIONS {
+            engine
+                .lock()
+                .expect("engine lock")
+                .advance(format!("\rfull {index:04}").as_bytes());
+            forced.reset();
+            let mut target = RenderTarget::new(&mut forced, area);
+            render_into(&mut target, &mut app);
+            std::hint::black_box(target.cursor());
+        }
+        let full = full_started.elapsed();
+        eprintln!(
+            "retained_projection iterations={ITERATIONS} partial_ns={} full_ns={} ratio={:.3}",
+            partial.as_nanos(),
+            full.as_nanos(),
+            partial.as_secs_f64() / full.as_secs_f64()
+        );
+    }
+}
+
+#[cfg(test)]
 mod bar_projection_tests {
     use super::*;
 
@@ -1285,5 +1475,62 @@ mod bar_projection_tests {
         assert!(app.switcher_close_rect.is_none());
         assert_eq!(app.pane_content_rects, desktop_content);
         assert_eq!(app.panes[&focus].size(), pty_size);
+    }
+}
+
+#[cfg(test)]
+mod dock_projection_tests {
+    use super::*;
+
+    /// A secondary or differently sized client must not overwrite the active
+    /// client's dock-divider hit targets. After projections at a much smaller
+    /// and a much larger size, `begin_dock_resize` still grabs the recorded row.
+    #[test]
+    fn render_projection_preserves_active_dock_dividers() {
+        let _env = crate::persist::test_env("dock-divider-projection");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        app.sidebars.left.docks = vec![DockKind::Workspaces, DockKind::Agents];
+        app.sidebars.left.visible = true;
+        app.sidebars.left.weights = Vec::new();
+
+        let area = Rect::new(0, 0, 120, 40);
+        let mut buffer = Buffer::empty(area);
+        let mut target = RenderTarget::new(&mut buffer, area);
+        render_into(&mut target, &mut app);
+
+        let recorded = app.dock_dividers.clone();
+        assert!(
+            !recorded.is_empty(),
+            "two stacked docks publish a divider hit target"
+        );
+        let (side, _, dy) = recorded[0];
+        let col = match side {
+            Side::Left => app.left_seam.expect("left seam after render").x,
+            Side::Right => app.right_seam.expect("right seam after render").x,
+        };
+
+        let small = Rect::new(0, 0, 40, 12);
+        let mut small_buffer = Buffer::empty(small);
+        let mut small_target = RenderTarget::new(&mut small_buffer, small);
+        render_projection(&mut small_target, &mut app);
+        assert_eq!(
+            app.dock_dividers, recorded,
+            "a smaller projection cannot replace the active divider hits"
+        );
+
+        let large = Rect::new(0, 0, 200, 80);
+        let mut large_buffer = Buffer::empty(large);
+        let mut large_target = RenderTarget::new(&mut large_buffer, large);
+        render_projection(&mut large_target, &mut app);
+        assert_eq!(
+            app.dock_dividers, recorded,
+            "a larger projection cannot replace the active divider hits"
+        );
+
+        assert!(
+            app.begin_dock_resize(col, dy),
+            "the recorded divider row is still a hit target after projection"
+        );
     }
 }

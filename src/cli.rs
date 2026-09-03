@@ -297,7 +297,7 @@ universal harness protocol:
   uhp schema                print the complete installed UHP JSON Schema bundle
   uhp snapshot              print a fenced session snapshot for harness bootstrap
   uhp events                stream sequenced UHP events
-  uhp access [--control]    expose scoped UHP through a private provider endpoint
+  uhp access [--control] [--ttl <seconds> | --no-expiry]   expose scoped UHP through a private provider endpoint
   uhp proxy                 forward one JSON request from stdin to the selected server
 
 sessions:
@@ -316,7 +316,7 @@ server:
   server restart             stop + start (load a newly-installed binary)
   server update-manifest     fetch the latest agent-detection rules from luvus.dev
                              (applies live if the server is up; else on next start)
-  integration install|uninstall <claude|copilot|codex|opencode|kimi|grok|hermes|omp>
+  integration install|uninstall <claude|copilot|codex|antigravity|opencode|kimi|grok|hermes|omp>
                              add/remove luvus's session-resume hook (uninstall
                              removes only luvus's hook, never the agent)
 ";
@@ -1226,8 +1226,15 @@ fn theme_cmd(args: &[String], context: crate::i18n::cli::Context) -> Result<i32>
                 }
                 Ok(_) | Err(_) => {
                     let mut config = crate::config::load();
+                    let baseline = config.clone();
                     config.theme = selected;
-                    crate::config::save(&config);
+                    if !crate::config::save_changes_with_patch(
+                        &baseline,
+                        &config,
+                        Some(&json!({"theme": config.theme.clone()})),
+                    ) {
+                        return Err(anyhow!(context.text("could not save the theme selection")));
+                    }
                     println!(
                         "{} {} — {}",
                         context.text("using theme"),
@@ -3976,7 +3983,7 @@ mod tests {
     #[test]
     fn uhp_help_includes_transport_neutral_access() {
         let help = rendered_topic_help("uhp", None);
-        assert!(help.contains("uhp access [--control]"));
+        assert!(help.contains("uhp access [--control] [--ttl <seconds> | --no-expiry]"));
         assert!(help.contains("private provider endpoint"));
     }
 
@@ -4011,6 +4018,22 @@ mod tests {
                 "{invalid:?}"
             );
         }
+    }
+
+    #[test]
+    fn theme_use_reports_a_config_write_failure() {
+        let _env = crate::persist::test_env("theme-write-failure");
+        let home = crate::persist::config_dir();
+        fs::write(&home, "not a directory").unwrap();
+
+        let result = theme_cmd(
+            &["use".into(), "quattro-rally".into()],
+            crate::i18n::cli::Context::for_language(crate::i18n::cli::Language::En),
+        );
+        fs::remove_file(home).unwrap();
+
+        let error = result.unwrap_err();
+        assert_eq!(error.to_string(), "could not save the theme selection");
     }
 
     #[test]
@@ -4727,7 +4750,7 @@ mod tests {
         assert!(readme.contains("User preferences live in `config.json`, not TOML"));
         assert!(readme.contains("https://luvus.dev/llms.txt as the task router"));
         assert!(llms.starts_with("# Luvus knowledge map for language models\n"));
-        assert!(llms.contains("https://luvus.dev/docs/reference/api/"));
+        assert!(llms.contains("https://luvus.dev/docs/uhp/methods/"));
     }
 
     #[test]

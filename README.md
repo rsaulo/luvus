@@ -90,10 +90,11 @@ Keyboard → Keyboard Shortcuts → Input Sources** to free `Ctrl+Space`.
 | Claude Code | ✓ | ✓ | ✓ |
 | GitHub Copilot CLI | ✓ | ✓ | ✓ |
 | Codex | ✓ | ✓ | ✓ |
+| Antigravity CLI | ✓ | ✓ | session only |
 | opencode | ✓ | ✓ | ✓ |
 | Kimi | ✓ | ✓ | ✓ |
 | Grok | ✓ | ✓ | ✓ |
-| Hermes CLI | ✓ | ✓ | No |
+| Hermes CLI | ✓ | ✓ with integration | session only |
 | Pi | ✓ | ✓ | No |
 | Oh My Pi (omp) | ✓ | ✓ | ✓ |
 | Muse Code | ✓ | ✓ | No |

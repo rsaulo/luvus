@@ -1,8 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
-use serde_json::{json, Value};
+use anyhow::{Context, Result};
 
 use super::super::types::IntegrationOperations;
 use crate::integration;
@@ -11,296 +10,313 @@ pub(super) const OPERATIONS: IntegrationOperations = IntegrationOperations {
     install,
     uninstall,
     is_installed,
+    hook: None,
 };
 
-const PLUGIN: &str = r#"// luvus opencode integration (docs/23) — reports the session id for native resume.
-// Auto-installed at <config>/opencode/plugin/luvus.js by `luvus integration install opencode`.
-import { spawn } from "node:child_process"
-
-export const luvus = async () => {
-  let last = ""
-  const luvusBin = process.env.LUVUS_BIN_PATH || "luvus"
-  const report = (id) => {
-    if (!id || id === last || !process.env.LUVUS_SOCKET_PATH) return
-    last = id
-    try {
-      spawn(luvusBin, ["pane", "report", "--agent", "opencode", "--session", String(id)], {
-        stdio: "ignore",
-        detached: true,
-      }).unref()
-    } catch {}
-  }
-  return {
-    event: async ({ event }) => {
-      if (event?.type === "session.created" || event?.type === "session.updated") {
-        const p = event.properties || {}
-        report(p.info?.id ?? p.sessionID ?? p.id ?? p.session?.id)
-      }
-    },
-  }
-}
-
-// V2 also auto-loads this directory, but it requires a `default` export and
-// rejects the V1 named-export shape above, which made it log a schema error on
-// every start. This inert plugin satisfies that contract without changing V1
-// behaviour; the real V2 integration is the package installed beside it.
-export default {
-  id: "luvus-v1-compat",
-  setup() {},
-}
-"#;
-
-/// OpenCode V2 keeps sessions in a database and loads a different plugin shape,
-/// so it gets its own package rather than a second file in `plugin/`.
-///
-/// The package is a directory with an `index.js` entrypoint: V2 rejects a
-/// configured plugin directory that has none ("configured plugin directory has
-/// no index entrypoint"), and a bare `.js` file registered in `cli.json` is
-/// resolved as an npm package, so it is silently skipped.
-///
-/// The server half exists only to advertise the TUI half through `tui: true`.
-/// The reporting itself has to run in the TUI: `LUVUS_PANE_ID` and
-/// `LUVUS_SOCKET_PATH` exist only in the TUI process inside a Luvus pane, and
-/// the shared background server sees every client's sessions at once, so it
-/// could not tell which session belongs to which pane.
-const PLUGIN_MANIFEST: &str = r#"{
-  "name": "luvus-opencode",
-  "version": "1.0.0",
-  "type": "module",
-  "private": true,
-  "exports": {
-    ".": "./index.js",
-    "./tui": "./tui.js"
-  },
-  "oc-plugin": ["server", "tui"]
-}
-"#;
-
-const PLUGIN_INDEX: &str = r#"// luvus opencode V2 integration — server half.
-// Auto-installed by `luvus integration install opencode`; see ./tui.js.
-//
-// This half does nothing on its own. `tui: true` is what makes OpenCode load
-// the package's `./tui` export inside each TUI, which is the only place a
-// pane's own session can be identified.
-export default {
-  id: "luvus",
-  tui: true,
-  setup() {},
-}
-"#;
-
-const PLUGIN_TUI: &str = r#"// luvus opencode V2 integration — TUI half.
-// Auto-installed by `luvus integration install opencode`.
-//
-// Binds the pane to the session currently open in it, so Mission Control can
-// attribute that session's persisted tokens and cost to this pane and so the
-// pane can be resumed natively.
-import { spawn } from "node:child_process"
-
-// The open route is read, not subscribed to, so this polls. One second is far
-// below human switching speed and costs two property reads per tick.
-const POLL_INTERVAL_MS = 1000
-
-export default {
-  id: "luvus",
-  setup(context) {
-    // Outside a Luvus pane there is nothing to report to.
-    if (!process.env.LUVUS_SOCKET_PATH) return
-
-    const bin = process.env.LUVUS_BIN_PATH || "luvus"
-    let last = ""
-
-    const report = (id) => {
-      last = id
-      try {
-        spawn(bin, ["pane", "report", "--agent", "opencode", "--session", String(id)], {
-          stdio: "ignore",
-          detached: true,
-        }).unref()
-      } catch {
-        // Best-effort: never take the TUI down over a status report.
-      }
-    }
-
-    const sync = () => {
-      let route
-      try {
-        route = context.ui.router.current()
-      } catch {
-        return
-      }
-      if (route?.type !== "session" || !route.sessionID) return
-      // Bind the pane to the root session so a subagent turn does not retarget
-      // it. Root resolution is best-effort: the route's own id is already
-      // correct, so a cold session tree must not suppress the report.
-      let id = route.sessionID
-      try {
-        id = context.data.session.root(id) || id
-      } catch {
-        // Tree not synced yet; the route id stands.
-      }
-      if (id !== last) report(id)
-    }
-
-    sync()
-    const timer = setInterval(sync, POLL_INTERVAL_MS)
-    return () => clearInterval(timer)
-  },
-}
-"#;
+const TUI_PLUGIN: &str = include_str!("luvus-tui.js");
 
 fn config_dir() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| integration::home().join(".config"))
         .join("opencode")
 }
 
-fn plugin_dir() -> PathBuf {
+fn tui_config_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("OPENCODE_TUI_CONFIG").filter(|value| !value.is_empty()) {
+        return PathBuf::from(path);
+    }
+    let jsonc = config_dir().join("tui.jsonc");
+    if jsonc.is_file() {
+        jsonc
+    } else {
+        config_dir().join("tui.json")
+    }
+}
+
+fn tui_plugin_path() -> PathBuf {
+    tui_config_path()
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("luvus-tui.mjs")
+}
+
+fn legacy_plugin_dir() -> PathBuf {
     config_dir().join("plugin")
 }
 
-fn plugin_path() -> PathBuf {
-    plugin_dir().join("luvus.js")
-}
-
-fn package_dir() -> PathBuf {
-    config_dir().join("luvus")
-}
-
-fn server_config_path() -> PathBuf {
-    config_dir().join("opencode.json")
-}
-
-/// V2 addresses configured plugins as URLs.
-fn package_spec() -> String {
-    format!("file://{}", package_dir().display())
-}
-
-/// An earlier layout registered a bare file in `cli.json`. It never loaded, so
-/// installs clean it up instead of leaving dead configuration behind.
-fn legacy_file() -> PathBuf {
-    config_dir().join("luvus-v2.js")
-}
-
-fn legacy_spec() -> String {
-    format!("file://{}", legacy_file().display())
-}
-
-enum Config {
-    /// No file yet: creating one is safe.
-    Missing,
-    Object(Value),
-    /// Present but not a JSON object we understand, e.g. JSONC with comments.
-    /// Never rewrite one of these; that would destroy user configuration.
-    Foreign,
-}
-
-fn read_config(path: &Path) -> Config {
-    let Ok(text) = fs::read_to_string(path) else {
-        return Config::Missing;
-    };
-    match serde_json::from_str::<Value>(&text) {
-        Ok(value) if value.is_object() => Config::Object(value),
-        _ => Config::Foreign,
-    }
-}
-
-fn write_config(path: &Path, config: &Value) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut text = serde_json::to_string_pretty(config)?;
-    text.push('\n');
-    fs::write(path, text)?;
-    Ok(())
-}
-
-fn listed(config: &Value, key: &str, spec: &str) -> bool {
-    config
-        .get(key)
-        .and_then(Value::as_array)
-        .is_some_and(|entries| entries.iter().any(|entry| entry.as_str() == Some(spec)))
-}
-
-/// Add the package to the server config's `plugin` list while preserving every
-/// unrelated setting and any other plugin the user configured.
-fn register() -> Result<()> {
-    let path = server_config_path();
-    let mut config = match read_config(&path) {
-        Config::Object(config) => config,
-        Config::Missing => json!({}),
-        Config::Foreign => return Ok(()),
-    };
-    if listed(&config, "plugin", &package_spec()) {
-        return Ok(());
-    }
-    let Some(object) = config.as_object_mut() else {
-        return Ok(());
-    };
-    let plugins = object
-        .entry("plugin")
-        .or_insert_with(|| Value::Array(Vec::new()));
-    let Some(list) = plugins.as_array_mut() else {
-        // Never discard a value we do not understand.
-        return Ok(());
-    };
-    list.push(Value::String(package_spec()));
-    write_config(&path, &config)
-}
-
-/// Drop only our entries, leaving the rest of each file untouched.
-fn unregister() -> Result<()> {
-    let path = server_config_path();
-    if let Config::Object(mut config) = read_config(&path) {
-        if listed(&config, "plugin", &package_spec()) {
-            if let Some(list) = config.get_mut("plugin").and_then(Value::as_array_mut) {
-                list.retain(|entry| entry.as_str() != Some(&package_spec()));
-            }
-            write_config(&path, &config)?;
+fn restore(path: &Path, previous: Option<&[u8]>) {
+    match previous {
+        Some(bytes) => {
+            let _ = integration::write_bytes_atomic(path, bytes);
+        }
+        None => {
+            let _ = fs::remove_file(path);
         }
     }
-    let cli = config_dir().join("cli.json");
-    if let Config::Object(mut config) = read_config(&cli) {
-        if listed(&config, "plugins", &legacy_spec()) {
-            if let Some(list) = config.get_mut("plugins").and_then(Value::as_array_mut) {
-                list.retain(|entry| entry.as_str() != Some(&legacy_spec()));
-            }
-            write_config(&cli, &config)?;
-        }
-    }
-    Ok(())
 }
 
 fn install() -> Result<()> {
-    let dir = plugin_dir();
-    fs::create_dir_all(&dir)?;
-    fs::write(plugin_path(), PLUGIN)?;
-    let _ = fs::remove_file(dir.join("bohay.js"));
+    let config_path = tui_config_path();
+    if let Some(parent) = config_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+    let original_config = match fs::read_to_string(&config_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "{}\n".to_string(),
+        Err(error) => return Err(error.into()),
+    };
+    // Parse and validate the user's config before writing any asset.
+    let updated_config = super::config::enable(&original_config)?;
 
-    let package = package_dir();
-    fs::create_dir_all(&package)?;
-    fs::write(package.join("package.json"), PLUGIN_MANIFEST)?;
-    fs::write(package.join("index.js"), PLUGIN_INDEX)?;
-    fs::write(package.join("tui.js"), PLUGIN_TUI)?;
+    let plugin_path = tui_plugin_path();
+    let original_plugin = match fs::read(&plugin_path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error).with_context(|| format!("read {}", plugin_path.display()));
+        }
+    };
+    integration::write_bytes_atomic(&plugin_path, TUI_PLUGIN.as_bytes())
+        .with_context(|| format!("write {}", plugin_path.display()))?;
+    if let Err(error) = integration::write_bytes_atomic(&config_path, updated_config.as_bytes()) {
+        restore(&plugin_path, original_plugin.as_deref());
+        return Err(error).with_context(|| format!("write {}", config_path.display()));
+    }
 
-    let _ = fs::remove_file(legacy_file());
-    register()
+    // Remove only obsolete Luvus-owned assets after the new TUI integration is
+    // complete. Server-wide session events cannot prove this pane's selection.
+    let _ = fs::remove_file(legacy_plugin_dir().join("luvus.js"));
+    let _ = fs::remove_file(legacy_plugin_dir().join("bohay.js"));
+    let _ = fs::remove_file(config_path.with_file_name("luvus-tui.js"));
+    Ok(())
 }
 
 fn uninstall() -> Result<()> {
-    let _ = fs::remove_file(plugin_path());
-    let _ = fs::remove_file(plugin_dir().join("bohay.js"));
-    let _ = fs::remove_dir_all(package_dir());
-    let _ = fs::remove_file(legacy_file());
-    unregister()
+    let config_path = tui_config_path();
+    match fs::read_to_string(&config_path) {
+        Ok(original) => {
+            let updated = super::config::disable(&original)?;
+            if updated != original {
+                integration::write_bytes_atomic(&config_path, updated.as_bytes())?;
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let _ = fs::remove_file(tui_plugin_path());
+    let _ = fs::remove_file(legacy_plugin_dir().join("luvus.js"));
+    let _ = fs::remove_file(legacy_plugin_dir().join("bohay.js"));
+    let _ = fs::remove_file(config_path.with_file_name("luvus-tui.js"));
+    Ok(())
 }
 
 fn is_installed() -> bool {
-    plugin_path().exists()
-        && package_dir().join("tui.js").exists()
-        && match read_config(&server_config_path()) {
-            Config::Object(config) => listed(&config, "plugin", &package_spec()),
-            _ => false,
+    tui_plugin_path().is_file()
+        && fs::read_to_string(tui_config_path())
+            .ok()
+            .is_some_and(|contents| super::config::enabled(&contents))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture(tag: &str) -> PathBuf {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-state/opencode-integration")
+            .join(format!("{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn install_is_idempotent_and_uninstall_preserves_unrelated_config() {
+        let _lock = crate::persist::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let root = fixture("lifecycle");
+        let old = std::env::var_os("XDG_CONFIG_HOME");
+        let old_tui = std::env::var_os("OPENCODE_TUI_CONFIG");
+        std::env::set_var("XDG_CONFIG_HOME", &root);
+        std::env::remove_var("OPENCODE_TUI_CONFIG");
+        let config = root.join("opencode/tui.json");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(
+            &config,
+            "{\n  // user setting\n  \"theme\": \"tokyonight\",\n  \"plugin\": [\"other\",],\n}\n",
+        )
+        .unwrap();
+
+        install().unwrap();
+        install().unwrap();
+        assert!(is_installed());
+        let installed = fs::read_to_string(&config).unwrap();
+        assert_eq!(
+            installed
+                .matches(super::super::config::TUI_PLUGIN_SPEC)
+                .count(),
+            1
+        );
+        assert!(installed.contains("// user setting"));
+        assert!(installed.contains("other"));
+        assert_eq!(fs::read_to_string(tui_plugin_path()).unwrap(), TUI_PLUGIN);
+
+        uninstall().unwrap();
+        assert!(!is_installed());
+        let removed = fs::read_to_string(&config).unwrap();
+        assert!(removed.contains("// user setting"));
+        assert!(removed.contains("other"));
+        assert!(!removed.contains(super::super::config::TUI_PLUGIN_SPEC));
+
+        match old {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
         }
+        match old_tui {
+            Some(value) => std::env::set_var("OPENCODE_TUI_CONFIG", value),
+            None => std::env::remove_var("OPENCODE_TUI_CONFIG"),
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn install_uses_the_effective_jsonc_or_explicit_tui_config() {
+        let _lock = crate::persist::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let root = fixture("config-path");
+        let old = std::env::var_os("XDG_CONFIG_HOME");
+        let old_tui = std::env::var_os("OPENCODE_TUI_CONFIG");
+        std::env::set_var("XDG_CONFIG_HOME", &root);
+        std::env::remove_var("OPENCODE_TUI_CONFIG");
+
+        let jsonc = root.join("opencode/tui.jsonc");
+        fs::create_dir_all(jsonc.parent().unwrap()).unwrap();
+        fs::write(&jsonc, "{ // jsonc wins\n}\n").unwrap();
+        install().unwrap();
+        assert!(fs::read_to_string(&jsonc)
+            .unwrap()
+            .contains(super::super::config::TUI_PLUGIN_SPEC));
+        assert!(!root.join("opencode/tui.json").exists());
+        uninstall().unwrap();
+
+        let explicit = root.join("custom/client.jsonc");
+        fs::create_dir_all(explicit.parent().unwrap()).unwrap();
+        fs::write(&explicit, "{ // explicit\n}\n").unwrap();
+        std::env::set_var("OPENCODE_TUI_CONFIG", &explicit);
+        install().unwrap();
+        assert!(fs::read_to_string(&explicit)
+            .unwrap()
+            .contains(super::super::config::TUI_PLUGIN_SPEC));
+        assert!(explicit.parent().unwrap().join("luvus-tui.mjs").is_file());
+        uninstall().unwrap();
+
+        match old {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        match old_tui {
+            Some(value) => std::env::set_var("OPENCODE_TUI_CONFIG", value),
+            None => std::env::remove_var("OPENCODE_TUI_CONFIG"),
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn invalid_config_fails_before_writing_the_plugin() {
+        let _lock = crate::persist::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let root = fixture("invalid");
+        let old = std::env::var_os("XDG_CONFIG_HOME");
+        let old_tui = std::env::var_os("OPENCODE_TUI_CONFIG");
+        std::env::set_var("XDG_CONFIG_HOME", &root);
+        std::env::remove_var("OPENCODE_TUI_CONFIG");
+        let config = root.join("opencode/tui.json");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(&config, r#"{"plugin":"do-not-replace"}"#).unwrap();
+
+        assert!(install().is_err());
+        assert!(!tui_plugin_path().exists());
+        assert_eq!(
+            fs::read_to_string(&config).unwrap(),
+            r#"{"plugin":"do-not-replace"}"#
+        );
+
+        match old {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        match old_tui {
+            Some(value) => std::env::set_var("OPENCODE_TUI_CONFIG", value),
+            None => std::env::remove_var("OPENCODE_TUI_CONFIG"),
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn existing_plugin_read_errors_stop_before_config_mutation() {
+        let _lock = crate::persist::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let root = fixture("unreadable-plugin");
+        let old = std::env::var_os("XDG_CONFIG_HOME");
+        let old_tui = std::env::var_os("OPENCODE_TUI_CONFIG");
+        std::env::set_var("XDG_CONFIG_HOME", &root);
+        std::env::remove_var("OPENCODE_TUI_CONFIG");
+        let config = root.join("opencode/tui.json");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(&config, "{}\n").unwrap();
+        fs::create_dir(tui_plugin_path()).unwrap();
+
+        let error = install().unwrap_err().to_string();
+        assert!(error.contains("read"), "unexpected error: {error}");
+        assert_eq!(fs::read_to_string(&config).unwrap(), "{}\n");
+        assert!(tui_plugin_path().is_dir());
+
+        match old {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        match old_tui {
+            Some(value) => std::env::set_var("OPENCODE_TUI_CONFIG", value),
+            None => std::env::remove_var("OPENCODE_TUI_CONFIG"),
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn explicit_config_does_not_create_the_default_opencode_directory() {
+        let _lock = crate::persist::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let root = fixture("explicit-only");
+        let old = std::env::var_os("XDG_CONFIG_HOME");
+        let old_tui = std::env::var_os("OPENCODE_TUI_CONFIG");
+        let explicit = root.join("custom/tui.jsonc");
+        std::env::set_var("XDG_CONFIG_HOME", root.join("xdg"));
+        std::env::set_var("OPENCODE_TUI_CONFIG", &explicit);
+
+        install().unwrap();
+        assert!(explicit.is_file());
+        assert!(root.join("custom/luvus-tui.mjs").is_file());
+        assert!(!root.join("xdg/opencode").exists());
+        uninstall().unwrap();
+
+        match old {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        match old_tui {
+            Some(value) => std::env::set_var("OPENCODE_TUI_CONFIG", value),
+            None => std::env::remove_var("OPENCODE_TUI_CONFIG"),
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 }

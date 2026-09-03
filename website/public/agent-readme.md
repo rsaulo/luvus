@@ -152,6 +152,8 @@ Every managed pane receives context:
 - `LUVUS_ENV=1` identifies a Luvus-managed environment.
 - `LUVUS_PANE_ID` identifies the current pane.
 - `LUVUS_SOCKET_PATH` identifies the selected session's control endpoint.
+- `LUVUS_API_ADDRESS` identifies the platform-native address used by direct
+  local integrations, including the complete named-pipe address on Windows.
 
 Preserve these variables when invoking `luvus`. They keep development, named,
 remote, and default sessions isolated. Do not replace the endpoint with a
@@ -282,9 +284,17 @@ discovery rather than inferring support from an agent name.
   and terminal state.
 - Supported agents can reopen their own conversation through native session
   discovery and resume commands.
-- Hermes session discovery works without setup. When exact pane ownership is
-  required, `luvus integration install hermes` adds an opt-in Hermes plugin
-  that reports each session once while retaining the native database fallback.
+- Antigravity CLI is detected natively. Its optional
+  `luvus integration install antigravity` hook reports only the exact
+  conversation id needed for `agy --conversation <id>` restore; screen
+  detection remains authoritative for state.
+- OpenCode detection and legacy JSON session discovery work without setup.
+  `luvus integration install opencode` adds a TUI-local plugin that reports
+  only the root session selected in that pane plus structured usage. Without
+  it, Mission Control leaves OpenCode usage unavailable instead of guessing.
+- `luvus integration install hermes` adds exact per-pane session ownership for
+  restart resume. Hermes detection still works without it, but Luvus does not
+  scan Hermes's private history database or guess a session.
 
 Do not claim every shell command resumes after restart. Do not guess native
 session IDs. List sessions and use the exact returned identifier.
@@ -330,7 +340,11 @@ machine-readable descriptor for a scoped loopback gateway and remains in the
 foreground. It does not start or bundle a transport provider. Forward the
 endpoint only through an authenticated encrypted byte stream, pair once, then
 discover live capabilities. `--control` requires the user's explicit
-authorization and remains limited by the gateway allowlist.
+authorization and remains limited by the gateway allowlist. `--ttl <seconds>`
+may set either access lifetime from 1 through 86400 seconds; otherwise
+read-only and control access both default to 24 hours. `--no-expiry` binds the
+client token to the foreground access process and keeps it valid until that
+process closes.
 
 ## Remote use
 
@@ -389,8 +403,8 @@ newer release.
 - Documentation index: https://luvus.dev/llms.txt
 - Documentation: https://luvus.dev/docs/
 - CLI reference: https://luvus.dev/docs/reference/cli/
-- UHP guide: https://luvus.dev/docs/guides/uhp/
-- UHP methods: https://luvus.dev/docs/reference/api/
+- UHP guide: https://luvus.dev/docs/uhp/getting-started/
+- UHP methods: https://luvus.dev/docs/uhp/methods/
 - Security: https://luvus.dev/docs/explanation/security/
 - Troubleshooting: https://luvus.dev/docs/faq/
 - Source and issues: https://github.com/RizRiyz/luvus

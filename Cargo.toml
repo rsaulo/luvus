@@ -89,12 +89,11 @@ getrandom = "0.3"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-# OpenCode 1.18+ stores per-session token and cost aggregates in SQLite. Read it
-# in-process and read-only: spawning the OpenCode/Bun runtime every Mission
-# Control refresh is both slower and substantially heavier. The one-shot query
-# does not use rusqlite's optional statement cache. macOS ships a stable SQLite
-# system library; other platforms retain the bundled engine so Cargo installs
-# and static release artifacts stay self-contained.
+# OpenCode stores per-session token and cost aggregates in SQLite. Read it
+# in-process and read-only. macOS ships a stable SQLite system library; other
+# platforms retain the bundled engine so Cargo installs and static release
+# artifacts stay self-contained. Upstream dropped this with #248; the personal
+# integration branch keeps the V2 usage reader.
 [target.'cfg(target_os = "macos")'.dependencies]
 rusqlite = { version = "0.40", default-features = false }
 

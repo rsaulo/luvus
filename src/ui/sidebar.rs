@@ -46,6 +46,11 @@ pub(super) type SidebarHits = (
 type WorkspaceHits = (Vec<(usize, Rect)>, Option<Rect>);
 type AgentHits = (Vec<(PaneId, Rect)>, Vec<(usize, Rect)>);
 
+/// Rows of sidebar chrome above the dock stack: the brand/menu row plus one
+/// blank separator row. The dock body, and therefore dock-height measurement
+/// during a divider drag, starts this many rows below the sidebar origin.
+pub(crate) const SIDEBAR_CHROME_ROWS: u16 = 2;
+
 /// Rows each list item occupies: two content rows, drawn back-to-back.
 const ROW_STRIDE: u16 = 2;
 
@@ -98,18 +103,37 @@ fn dock_slots(body: Rect, weights: &[u16]) -> (Vec<Rect>, Vec<u16>) {
     }
     let bottom = body.bottom();
     let mut y = body.y;
+    // Equal weights keep the legacy even split (`remaining / docks_left`), so a
+    // sidebar that has never been dragged lays out to the cell it always did.
+    // Unequal weights — including rendered heights stored after a drag — are
+    // proportioned against the *content* rows still unallocated (remaining
+    // minus the divider rows still to be drawn). That is the pool those
+    // heights already sum to, so a second layout produces the same geometry
+    // instead of stealing a row from an untouched dock to pay for a divider.
+    let equal = weights.iter().all(|w| *w == weights[0]);
     for i in 0..n {
         let remaining = bottom.saturating_sub(y);
-        // Share of what is left, by weight. With equal weights this reduces
-        // exactly to the former `remaining / docks_left`, so an unresized
-        // sidebar lays out to the cell as it always did.
         let weight_left: u32 = weights[i..].iter().map(|w| u32::from(*w)).sum();
-        let h = if weight_left == 0 {
-            0
+        let docks_left = (n - i) as u16;
+        let pool = if equal {
+            remaining
         } else {
-            (u32::from(remaining) * u32::from(weights[i]) / weight_left) as u16
+            remaining.saturating_sub(docks_left.saturating_sub(1))
         };
-        slots.push(Rect::new(body.x, y, body.width, h));
+        let share = (u32::from(pool) * u32::from(weights[i]))
+            .checked_div(weight_left)
+            .unwrap_or(0) as u16;
+        // The drag keeps both sides of a divider at the floor, but weights are
+        // relative and the body is not: a lopsided pair, or the same pair after
+        // the terminal shrinks, can round a share down to nothing and hide a
+        // dock. Hold the floor here too, while reserving what the docks below
+        // still need (their own floor plus a divider row each) so honouring it
+        // cannot starve them. On a body too small for every floor the
+        // reservation shrinks the ceiling below the floor, and the `min` keeps
+        // the clamp well-formed while the layout degrades evenly.
+        let reserved = docks_left.saturating_sub(1) * (crate::app::MIN_DOCK_HEIGHT + 1);
+        let ceiling = remaining.saturating_sub(reserved);
+        let h = share.clamp(crate::app::MIN_DOCK_HEIGHT.min(ceiling), ceiling);        slots.push(Rect::new(body.x, y, body.width, h));
         y += h;
         if i + 1 < n {
             dividers.push(y);
@@ -178,7 +202,7 @@ pub(super) fn draw_sidebar(
     // blank separator row). The body is inset by one column on the separator side
     // so a dock never paints over the edge rule; the dock draw fns stay
     // side-agnostic.
-    let body_top = area.y + 2;
+    let body_top = area.y.saturating_add(SIDEBAR_CHROME_ROWS);
     let (body_x, body_w) = match side {
         Side::Left => (area.x, area.width),
         Side::Right => (area.x + 1, area.width.saturating_sub(1)),
@@ -216,7 +240,7 @@ pub(super) fn draw_sidebar(
                 session_rects = s;
             }
             DockKind::Files => super::files::draw_files_dock(f, slot, app, t),
-            DockKind::Module(id) => draw_module_dock(f, slot, id, app, t),
+            DockKind::Module(id) => draw_module_dock(f, slot, &id, app, t),
         }
     }
 
@@ -611,14 +635,9 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                     Style::new().fg(t.subtext1)
                 };
                 agent_rects.push((id, Rect::new(area.x, y, area.width, 2)));
-                // A working agent gets a live rotating-circle spinner in the dot
-                // slot; every other state keeps its static dot.
-                let dot = if st == State::Working {
-                    f.mark_working_animation();
-                    crate::ui::theme::spinner_frame(app.spinner)
-                } else {
-                    st.dot()
-                };
+                // Working stays visually prominent without scheduling animation
+                // frames while the agent is busy.
+                let dot = st.dot();
                 let label = format!(" {}  ", st.label());
                 let prefix_w = crate::ui::display_width(dot) + crate::ui::display_width(&label);
                 let agent = crate::ui::truncate(&agent, (cw as usize).saturating_sub(prefix_w));
@@ -793,6 +812,29 @@ mod tests {
         assert_eq!(used, body.height);
     }
 
+    /// Rendered heights stored as weights after a drag must survive a second
+    /// layout pass. The previous formula proportioned against remaining rows
+    /// *including* dividers, so `[15, 8, 5]` on a 30-row body became `[16, 8, 4]`
+    /// and grew a dock that was not part of the drag.
+    #[test]
+    fn persisted_heights_round_trip_through_layout() {
+        let body = ratatui::layout::Rect::new(0, 0, 20, 30);
+        let weights = [15_u16, 8, 5];
+        let (slots, dividers) = super::dock_slots(body, &weights);
+        assert_eq!(
+            slots.iter().map(|s| s.height).collect::<Vec<_>>(),
+            weights,
+            "heights used as weights must reproduce themselves"
+        );
+        assert_eq!(dividers, vec![15, 24]);
+        let (again, dividers_again) = super::dock_slots(body, &weights);
+        assert_eq!(
+            again.iter().map(|s| s.height).collect::<Vec<_>>(),
+            weights,
+            "a second pass must not drift"
+        );
+        assert_eq!(dividers_again, dividers);
+    }
     /// A weighted split hands out the sidebar in proportion, and still spends
     /// every row.
     #[test]
@@ -806,6 +848,45 @@ mod tests {
         assert_eq!(used, body.height, "no row is lost to rounding");
     }
 
+    /// Weights are relative but the body is not, so a lopsided pair — or an
+    /// ordinary one after the terminal shrinks — could round a share down to
+    /// nothing and hide a dock. Every dock keeps the floor the drag promises.
+    #[test]
+    fn a_lopsided_weight_still_keeps_every_dock_at_the_floor() {
+        let floor = crate::app::MIN_DOCK_HEIGHT;
+        let body = ratatui::layout::Rect::new(0, 0, 20, 20);
+        let (slots, dividers) = super::dock_slots(body, &[1, 100]);
+        assert_eq!(
+            slots[0].height, floor,
+            "the starved dock is held at the floor"
+        );
+        assert!(
+            slots[1].height >= floor,
+            "and the greedy one still fits: {slots:?}"
+        );
+        let used: u16 = slots.iter().map(|s| s.height).sum::<u16>() + dividers.len() as u16;
+        assert_eq!(used, body.height, "no row is lost");
+
+        // Three docks, with the middle one starved.
+        let (slots, _) = super::dock_slots(body, &[100, 1, 100]);
+        for slot in &slots {
+            assert!(
+                slot.height >= floor,
+                "every dock keeps the floor: {slots:?}"
+            );
+        }
+    }
+
+    /// A body too small to give every dock its floor must still lay out and
+    /// spend every row rather than panic on an inverted clamp.
+    #[test]
+    fn a_body_below_every_floor_degrades_instead_of_panicking() {
+        let body = ratatui::layout::Rect::new(0, 0, 20, 5);
+        let (slots, dividers) = super::dock_slots(body, &[1, 1]);
+        assert_eq!(slots.len(), 2);
+        let used: u16 = slots.iter().map(|s| s.height).sum::<u16>() + dividers.len() as u16;
+        assert_eq!(used, body.height);
+    }
     use crate::app::App;
     use crate::event::AppEvent;
     use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -863,9 +944,7 @@ mod tests {
     }
 
     // The state icon sits in a fixed one-column slot, so the text after it must
-    // start at the same column no matter which state is shown — and, for a
-    // working agent, at every frame of the spinner. Otherwise the row visibly
-    // shifts as the icon animates.
+    // start at the same column no matter which state is shown.
     /// The fg colour of the first cell of the row containing `needle`.
     fn fg_of_row(term: &Terminal<TestBackend>, needle: &str) -> Option<ratatui::style::Color> {
         let buf = term.backend().buffer();
@@ -968,22 +1047,13 @@ mod tests {
         app.status.get_mut(&id).unwrap().agent = "claude".into();
         let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
 
-        // Where the label lands for each static state.
+        // Where the label lands for each state.
         let mut columns = Vec::new();
-        for st in [State::Idle, State::Blocked, State::Done] {
+        for st in [State::Idle, State::Blocked, State::Working, State::Done] {
             app.status.get_mut(&id).unwrap().state = st;
             term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
             let cols = label_columns(&term, st.label());
             assert!(!cols.is_empty(), "the {st:?} row should be drawn");
-            columns.extend(cols);
-        }
-        // …and for every frame of the working spinner.
-        app.status.get_mut(&id).unwrap().state = State::Working;
-        for frame in 0..crate::ui::theme::SPINNER_FRAMES {
-            app.spinner = frame;
-            term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
-            let cols = label_columns(&term, State::Working.label());
-            assert!(!cols.is_empty(), "the working row should be drawn");
             columns.extend(cols);
         }
 
