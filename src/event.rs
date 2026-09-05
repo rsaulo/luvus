@@ -134,6 +134,12 @@ pub enum AppEvent {
         generation: u64,
         result: Result<Vec<crate::session::SessionInfo>, String>,
     },
+    /// A stop request for a named session finished (from the session-menu context menu).
+    NamedSessionStopped {
+        generation: u64,
+        name: String,
+        result: Result<(), String>,
+    },
     /// A selected named session is ready for this client to attach.
     NamedSessionPrepared {
         generation: u64,
@@ -321,7 +327,7 @@ pub enum AppEvent {
     AgentWait {
         id: String,
         pane: String,
-        state: String,
+        states: Vec<String>,
         timeout: Option<std::time::Duration>,
         reply: Sender<String>,
         cancelled: Arc<AtomicBool>,
@@ -344,4 +350,9 @@ pub enum AppEvent {
         reply: Sender<String>,
         cancelled: Arc<AtomicBool>,
     },
+    /// A termination signal arrived. The handler only writes a self-pipe; this
+    /// event wakes a sleeping event loop so shutdown does not wait on a timer.
+    /// Windows has no POSIX signals; the detached server stops via `server stop`.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Shutdown,
 }

@@ -66,6 +66,13 @@ pub struct Config {
     /// upgrade. The visible All / Active control updates this preference.
     #[serde(default)]
     pub agents_active_only: bool,
+    /// Scope the AGENTS dock to the active workspace. This is a second axis,
+    /// independent of All / Active: that one selects lifecycle, this one selects
+    /// which project's rows are visible. Missing values keep the All-workspaces
+    /// default, so an upgrade never hides rows the user was already seeing. The
+    /// visible scope chip updates this preference.
+    #[serde(default)]
+    pub agents_this_workspace: bool,
     /// Custom keybindings: command id → key string (overrides the defaults).
     /// An empty value means the command is explicitly unbound.
     #[serde(default)]
@@ -211,6 +218,15 @@ pub struct LayoutConfig {
     /// useful title.
     #[serde(default)]
     pub agent_title: bool,
+    /// Show the cwd line beneath each WORKSPACES entry. On by default to retain
+    /// the established two-row presentation; the row context menu persists the
+    /// compact one-row preference when this is disabled.
+    #[serde(default = "yes")]
+    pub workspace_paths: bool,
+    /// Show the workspace/path detail line beneath each AGENTS entry. On by
+    /// default; the row context menu can hide it for a denser one-row list.
+    #[serde(default = "yes")]
+    pub agent_paths: bool,
     /// Resume a session into its own workspace (else a new tab in the current one).
     #[serde(default = "yes", alias = "resume_in_new_node")]
     pub resume_in_new_workspace: bool,
@@ -458,6 +474,7 @@ impl Default for Config {
             check_updates: true,
             resume_launch_flags: false,
             agents_active_only: false,
+            agents_this_workspace: false,
             keybindings: std::collections::HashMap::new(),
             direct_keybindings: std::collections::HashMap::new(),
             prefix: default_prefix(),
@@ -477,6 +494,8 @@ impl Default for LayoutConfig {
             show_titles: true,
             pane_title_path: false,
             agent_title: false,
+            workspace_paths: true,
+            agent_paths: true,
             resume_in_new_workspace: true,
             new_pane_to_workspace_root: false,
             file_open: default_file_open(),
@@ -780,12 +799,16 @@ mod tests {
         let c = Config::default();
         assert_eq!(c.theme, "quattro-rally");
         assert!(c.layout.show_titles);
+        assert!(c.layout.workspace_paths);
+        assert!(c.layout.agent_paths);
         assert_eq!(c.layout.col_gap, 1);
         assert_eq!(c.layout.mobile_width, crate::app::MOBILE_WIDTH);
         // Empty object → all defaults (forward/back compat).
         let from_empty: Config = serde_json::from_str("{}").unwrap();
         assert_eq!(from_empty.theme, "quattro-rally");
         assert_eq!(from_empty.sidebar_width, SIDEBAR_WIDTH_DEFAULT);
+        assert!(from_empty.layout.workspace_paths);
+        assert!(from_empty.layout.agent_paths);
         assert!(
             from_empty.direct_keybindings.is_empty(),
             "existing configs do not gain input-stealing direct shortcuts"
@@ -793,6 +816,10 @@ mod tests {
         assert!(
             !from_empty.agents_active_only,
             "old configs retain the All agents default"
+        );
+        assert!(
+            !from_empty.agents_this_workspace,
+            "old configs retain the All-workspaces agents scope"
         );
         assert_eq!(
             from_empty.bars.bottom_right,
@@ -870,6 +897,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(old.notifications.sound_style, crate::sound::STYLE_RETRO);
+    }
+
+    #[test]
+    fn agents_scope_preference_persists_both_choices() {
+        let _env = crate::persist::test_env("config-agents-scope");
+        let mut config = Config::default();
+        assert!(!config.agents_this_workspace);
+
+        config.agents_this_workspace = true;
+        save(&config);
+        assert!(load().agents_this_workspace);
+
+        config.agents_this_workspace = false;
+        save(&config);
+        assert!(!load().agents_this_workspace);
     }
 
     #[test]
