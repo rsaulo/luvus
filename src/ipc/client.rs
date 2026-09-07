@@ -199,6 +199,7 @@ where
         &ClientMessage::TerminalProbe {
             colors: probe.colors,
             graphics: probe.graphics,
+            cell_size: probe.cell_size,
         },
     )?;
     let pending = probe.pending;
@@ -1017,6 +1018,7 @@ mod tests {
             &ClientMessage::TerminalProbe {
                 colors: Some(colors),
                 graphics: None,
+                cell_size: None,
             },
         )
         .unwrap();
