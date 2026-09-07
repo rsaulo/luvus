@@ -141,7 +141,11 @@ where
     R: Read,
     W: Write + Send + 'static,
 {
-    let truecolor = protocol::truecolor_supported();
+    let mut host = HostTerminal {
+        truecolor: protocol::truecolor_supported(),
+        // Answered by the probe below, before any frame is painted.
+        graphics: false,
+    };
     let size = terminal.size()?;
     write_handshake_message(
         &mut writer,
@@ -181,17 +185,23 @@ where
         }
     }
 
-    let probe_terminal = match read_handshake_message(&mut reader)? {
-        ServerMessage::Ready { probe_terminal } => probe_terminal,
+    let probe_colors = match read_handshake_message(&mut reader)? {
+        ServerMessage::Ready { probe_colors } => probe_colors,
         _ => return Err(anyhow!("unexpected handshake negotiation")),
     };
-    let pending = if probe_terminal {
-        let probe = crate::terminal::theme_probe::probe();
-        protocol::write_message(&mut writer, &ClientMessage::TerminalColors(probe.colors))?;
-        probe.pending
-    } else {
-        Vec::new()
-    };
+    // The probe always runs. The server needs to know whether this terminal can
+    // draw images no matter which theme is configured, and asking costs one
+    // round trip that the palette query would otherwise pay for alone.
+    let probe = crate::terminal::theme_probe::probe(probe_colors);
+    host.graphics = probe.graphics.unwrap_or(false);
+    protocol::write_message(
+        &mut writer,
+        &ClientMessage::TerminalProbe {
+            colors: probe.colors,
+            graphics: probe.graphics,
+        },
+    )?;
+    let pending = probe.pending;
     crate::logging::event(
         crate::logging::EventKind::ClientHandshake,
         &[
@@ -236,7 +246,7 @@ where
                 sync_begin();
                 let r = paint(
                     terminal,
-                    &frame_cells(&frame, truecolor),
+                    &frame_cells(&frame, host),
                     frame.cursor,
                     frame.cursor_visible,
                     true,
@@ -257,7 +267,7 @@ where
                 sync_begin();
                 let r = paint(
                     terminal,
-                    &diff_cells(&diff, truecolor),
+                    &diff_cells(&diff, host),
                     diff.cursor,
                     diff.cursor_visible,
                     false,
@@ -274,6 +284,10 @@ where
                 }
                 r?;
             }
+            // Ahead of the frame whose placeholder cells refer to these, on the
+            // same ordered channel, so the terminal always knows an image
+            // before it is asked to draw one.
+            Ok(ServerMessage::Graphics(commands)) => crate::emit_graphics(&commands),
             Ok(ServerMessage::Notify(msg)) => crate::emit_notification(&msg),
             Ok(ServerMessage::Sound(signal)) => crate::emit_sound(signal),
             Ok(ServerMessage::Clipboard(text)) => crate::emit_clipboard(&text),
@@ -505,10 +519,54 @@ fn sync_end() {
     let _ = out.flush();
 }
 
+/// What this client's own terminal can do with a cell.
+///
+/// Every attached client sees the same frame, because the panes are shared, but
+/// the terminals in front of each user are not the same. Both of these describe
+/// the terminal this process is writing to, never the pane.
+#[derive(Clone, Copy)]
+struct HostTerminal {
+    /// Whether 24-bit color reaches the terminal intact.
+    truecolor: bool,
+    /// Whether it draws kitty graphics.
+    graphics: bool,
+}
+
+impl HostTerminal {
+    /// A terminal with nothing in the way of what the server sends, so a test
+    /// asserting on frame content sees the cells exactly as they arrived.
+    #[cfg(test)]
+    fn drawing() -> Self {
+        Self {
+            truecolor: true,
+            graphics: true,
+        }
+    }
+}
+
 /// Build one ratatui `Cell` from wire fields (control chars → space; 256-color
 /// downsampling on non-truecolor terminals).
-fn make_cell(sym: &str, fg: u32, bg: u32, mods: u16, truecolor: bool) -> Cell {
-    let adjust = |c| if truecolor { c } else { protocol::to_256(c) };
+fn make_cell(sym: &str, fg: u32, bg: u32, mods: u16, host: HostTerminal) -> Cell {
+    // An image cell is not text. Where the terminal draws images it resolves
+    // the cell against the image whose id the foreground carries, so both the
+    // character and that id must survive exactly — downsampling the id to the
+    // nearest 256-color entry would point the cell at a different image, or
+    // none. Where the terminal draws no images there is nothing to resolve it
+    // against, and printing the character would put a private-use glyph on
+    // screen, so it is blanked instead.
+    let image_cell = crate::terminal::graphics::placeholder::is_placeholder(sym);
+    if image_cell && !host.graphics {
+        let mut cell = Cell::default();
+        cell.set_symbol(" ");
+        cell.set_bg(if host.truecolor {
+            protocol::unpack(bg)
+        } else {
+            protocol::to_256(protocol::unpack(bg))
+        });
+        return cell;
+    }
+    let exact = host.truecolor || image_cell;
+    let adjust = |c| if exact { c } else { protocol::to_256(c) };
     // ratatui panics on control chars in a symbol; the server filters, but never
     // trust the wire. (Empty symbols are wide-char continuations and are already
     // skipped by `frame_cells`/`diff_cells`, so they never reach here.)
@@ -526,7 +584,7 @@ fn make_cell(sym: &str, fg: u32, bg: u32, mods: u16, truecolor: bool) -> Cell {
 }
 
 /// Every cell of a full frame as `(x, y, Cell)`.
-fn frame_cells(frame: &FrameData, truecolor: bool) -> Vec<(u16, u16, Cell)> {
+fn frame_cells(frame: &FrameData, host: HostTerminal) -> Vec<(u16, u16, Cell)> {
     frame
         .cells
         .iter()
@@ -543,14 +601,14 @@ fn frame_cells(frame: &FrameData, truecolor: bool) -> Vec<(u16, u16, Cell)> {
             (
                 i % frame.width,
                 i / frame.width,
-                make_cell(&c.symbol, c.fg, c.bg, c.mods, truecolor),
+                make_cell(&c.symbol, c.fg, c.bg, c.mods, host),
             )
         })
         .collect()
 }
 
 /// Only the changed cells of a diff as `(x, y, Cell)` — the whole point: O(changed).
-fn diff_cells(diff: &FrameDiff, truecolor: bool) -> Vec<(u16, u16, Cell)> {
+fn diff_cells(diff: &FrameDiff, host: HostTerminal) -> Vec<(u16, u16, Cell)> {
     let w = diff.width as u32;
     let mut cells = Vec::new();
     for run in &diff.runs {
@@ -562,7 +620,7 @@ fn diff_cells(diff: &FrameDiff, truecolor: bool) -> Vec<(u16, u16, Cell)> {
             cells.push((
                 (i % w) as u16,
                 (i / w) as u16,
-                make_cell(sym, run.fg, run.bg, run.mods, truecolor),
+                make_cell(sym, run.fg, run.bg, run.mods, host),
             ));
         }
     }
@@ -710,7 +768,7 @@ mod tests {
             cursor: None,
             cursor_visible: false,
         };
-        let cells = super::frame_cells(&frame, true);
+        let cells = super::frame_cells(&frame, super::HostTerminal::drawing());
         let syms: Vec<(u16, String)> = cells
             .iter()
             .map(|(x, _, cell)| (*x, cell.symbol().to_string()))
@@ -943,9 +1001,7 @@ mod tests {
             ),
         }
         match protocol::read_message::<_, ServerMessage>(&mut reader).unwrap() {
-            ServerMessage::Ready {
-                probe_terminal: true,
-            } => {}
+            ServerMessage::Ready { probe_colors: true } => {}
             _ => panic!("terminal theme should request the client palette"),
         }
         let colors = crate::terminal::theme_probe::TerminalColors {
@@ -956,7 +1012,14 @@ mod tests {
                 [20, 20, 20],
             ),
         };
-        protocol::write_message(&mut writer, &ClientMessage::TerminalColors(Some(colors))).unwrap();
+        protocol::write_message(
+            &mut writer,
+            &ClientMessage::TerminalProbe {
+                colors: Some(colors),
+                graphics: None,
+            },
+        )
+        .unwrap();
         writer.flush().unwrap();
 
         let mut got_frame = false;
@@ -1047,6 +1110,75 @@ mod render_tests {
         );
     }
 
+    /// Two users can watch the same pane through different terminals. The
+    /// frame is one and the same, so the cell that carries an image has to be
+    /// resolved per client: drawn where the terminal has the image, blanked
+    /// where it does not — printing the private-use character instead would put
+    /// a tofu box on that user's screen.
+    #[test]
+    fn an_image_cell_is_drawn_or_blanked_according_to_each_clients_terminal() {
+        let image = "\u{10eeee}\u{0305}\u{0305}";
+        // The id rides in the foreground; 42 is `Rgb(0, 0, 42)` on the wire.
+        let fg = protocol::pack(ratatui::style::Color::Rgb(0, 0, 42));
+
+        let drawing = make_cell(image, fg, 0, 0, HostTerminal::drawing());
+        assert_eq!(drawing.symbol(), image, "the cell must reach the terminal");
+        assert_eq!(
+            drawing.fg,
+            ratatui::style::Color::Rgb(0, 0, 42),
+            "the image id must survive exactly, not be downsampled to a color"
+        );
+
+        // The same cell, at a terminal that cannot draw it.
+        let text_only = make_cell(
+            image,
+            fg,
+            0,
+            0,
+            HostTerminal {
+                truecolor: true,
+                graphics: false,
+            },
+        );
+        assert_eq!(text_only.symbol(), " ", "no tofu on a terminal without it");
+
+        // And at a terminal that draws images but downsamples color: the id
+        // must still not be rewritten.
+        let downsampling = make_cell(
+            image,
+            fg,
+            0,
+            0,
+            HostTerminal {
+                truecolor: false,
+                graphics: true,
+            },
+        );
+        assert_eq!(
+            downsampling.fg,
+            ratatui::style::Color::Rgb(0, 0, 42),
+            "an image id is not a color and must escape the 256-color path"
+        );
+
+        // Ordinary text is unaffected by any of this.
+        let text = make_cell(
+            "x",
+            protocol::pack(ratatui::style::Color::Rgb(200, 100, 50)),
+            0,
+            0,
+            HostTerminal {
+                truecolor: false,
+                graphics: true,
+            },
+        );
+        assert_eq!(text.symbol(), "x");
+        assert!(
+            !matches!(text.fg, ratatui::style::Color::Rgb(..)),
+            "text still downsamples where the terminal needs it: {:?}",
+            text.fg
+        );
+    }
+
     #[test]
     fn incremental_diff_reconstructs_the_screen() {
         let cell = |s: &str| protocol::CellData {
@@ -1075,7 +1207,7 @@ mod render_tests {
         // Paint a full frame, then apply a diff that changes only one cell.
         paint(
             &mut term,
-            &frame_cells(&f0, true),
+            &frame_cells(&f0, HostTerminal::drawing()),
             f0.cursor,
             f0.cursor_visible,
             true,
@@ -1091,7 +1223,7 @@ mod render_tests {
         };
         paint(
             &mut term,
-            &diff_cells(&diff, true),
+            &diff_cells(&diff, HostTerminal::drawing()),
             diff.cursor,
             diff.cursor_visible,
             false,
@@ -1137,7 +1269,7 @@ mod paint_tests {
         let mut last = None;
         paint(
             &mut term,
-            &super::frame_cells(&f0, true),
+            &super::frame_cells(&f0, super::HostTerminal::drawing()),
             f0.cursor,
             f0.cursor_visible,
             true,
@@ -1168,7 +1300,7 @@ mod paint_tests {
         };
         paint(
             &mut term,
-            &super::diff_cells(&diff, true),
+            &super::diff_cells(&diff, super::HostTerminal::drawing()),
             diff.cursor,
             diff.cursor_visible,
             false,
@@ -1197,7 +1329,7 @@ mod paint_tests {
         let mut last = None;
         paint(
             &mut term,
-            &super::frame_cells(&f0, true),
+            &super::frame_cells(&f0, super::HostTerminal::drawing()),
             f0.cursor,
             f0.cursor_visible,
             true,
@@ -1227,7 +1359,7 @@ mod paint_tests {
         };
         paint(
             &mut term,
-            &super::diff_cells(&diff, true),
+            &super::diff_cells(&diff, super::HostTerminal::drawing()),
             diff.cursor,
             diff.cursor_visible,
             false,
@@ -1256,7 +1388,7 @@ mod paint_tests {
         };
         paint(
             &mut term,
-            &super::frame_cells(&f0, true),
+            &super::frame_cells(&f0, super::HostTerminal::drawing()),
             f0.cursor,
             f0.cursor_visible,
             true,
@@ -1287,7 +1419,7 @@ mod paint_tests {
         };
         paint(
             &mut term,
-            &super::frame_cells(&f0, true),
+            &super::frame_cells(&f0, super::HostTerminal::drawing()),
             f0.cursor,
             f0.cursor_visible,
             true,

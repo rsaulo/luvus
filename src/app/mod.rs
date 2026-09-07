@@ -2142,6 +2142,10 @@ pub struct App {
     pub theme: Theme,
     /// Appearance reported to programs running inside panes.
     pane_appearance: crate::terminal::appearance::PaneAppearance,
+    /// Whether any attached client's terminal can draw images. Shared with
+    /// every pane's engine, which answers the kitty graphics support query
+    /// synchronously while parsing child output.
+    host_graphics: crate::terminal::graphics::HostGraphics,
     /// Last foreground-client palette used to resolve the virtual Terminal theme.
     probed_appearance: Option<crate::terminal::appearance::PaneAppearance>,
     /// Built-in, installed, and virtual themes in Settings display order.
@@ -2781,6 +2785,7 @@ impl App {
         let theme_registry = crate::theme::ThemeRegistry::load();
         let theme = theme_registry.theme_or_default(&config.theme);
         let pane_appearance = child_appearance(&theme_registry, &config.theme, &theme, None);
+        let host_graphics = crate::terminal::graphics::HostGraphics::default();
         let catalog = crate::i18n::by_code(&config.language);
         let sidebars = Sidebars::from_config(&config.sidebars());
         let shell = crate::platform::resolve_shell(&config.shell);
@@ -2802,6 +2807,7 @@ impl App {
             &shell,
             config.scrollback_bytes(),
             pane_appearance,
+            host_graphics.clone(),
         )?;
         let command = pane.command.clone();
         let mut panes = HashMap::new();
@@ -2843,6 +2849,7 @@ impl App {
             closed_workspace_paths: Vec::new(),
             theme,
             pane_appearance,
+            host_graphics,
             probed_appearance: None,
             theme_registry,
             catalog,
@@ -3142,6 +3149,7 @@ impl App {
         let theme_registry = crate::theme::ThemeRegistry::load();
         let theme = theme_registry.theme_or_default(&config.theme);
         let pane_appearance = child_appearance(&theme_registry, &config.theme, &theme, None);
+        let host_graphics = crate::terminal::graphics::HostGraphics::default();
         let keymap = keys::build_keymap(&config.keybindings);
         let direct_keymap = keys::build_direct_keymap(&config.direct_keybindings);
         let prefix = keys::PrefixSpec::parse(&config.prefix).unwrap_or_default();
@@ -3338,6 +3346,7 @@ impl App {
                             &app_tx,
                             history_budget_bytes,
                             pane_appearance,
+                            host_graphics.clone(),
                         )
                     });
                     let (pane, module_rec) = match restored {
@@ -3371,6 +3380,7 @@ impl App {
                                     argv,
                                     history_budget_bytes,
                                     pane_appearance,
+                                    host_graphics.clone(),
                                 )
                                 .ok(),
                                 None => Some(Pane::spawn_restored(
@@ -3384,6 +3394,7 @@ impl App {
                                     &shell,
                                     history_budget_bytes,
                                     pane_appearance,
+                                    host_graphics.clone(),
                                 )),
                             };
                             let Some(pane) = pane else {
@@ -3494,6 +3505,7 @@ impl App {
             closed_workspace_paths,
             theme,
             pane_appearance,
+            host_graphics,
             probed_appearance: None,
             theme_registry,
             catalog,
@@ -3777,6 +3789,40 @@ impl App {
             self.downsample = true;
             self.theme = self.theme.to_256();
         }
+    }
+
+    /// Record whether any attached client's terminal can draw images.
+    ///
+    /// Every pane's engine shares this one value, so a child that asks the
+    /// kitty graphics support question mid-parse is answered against the
+    /// clients attached at that instant.
+    pub fn set_host_graphics(&mut self, supported: bool) {
+        self.host_graphics.set(supported);
+    }
+
+    /// Whether an image a pane's child emits would reach a screen right now.
+    pub fn host_graphics_available(&self) -> bool {
+        self.host_graphics.supported()
+    }
+
+    /// Take the kitty graphics commands every pane has waiting.
+    ///
+    /// Returns nothing, without touching a pane, unless one of them signalled
+    /// that it queued something — a render pass runs constantly and must not
+    /// lock every engine to discover there is no image.
+    pub fn take_pane_graphics(&mut self) -> Vec<Vec<u8>> {
+        if !self.host_graphics.take_pending() {
+            return Vec::new();
+        }
+        let mut commands = Vec::new();
+        for pane in self.panes.values() {
+            if let Ok(mut engine) = pane.engine.lock() {
+                if engine.has_graphics() {
+                    commands.append(&mut engine.take_graphics());
+                }
+            }
+        }
+        commands
     }
 
     /// Apply colors reported by the terminal displaying the foreground client.
@@ -4551,6 +4597,7 @@ impl App {
             &shell,
             history_budget_bytes,
             self.pane_appearance,
+            self.host_graphics.clone(),
         ) {
             Ok(pane) => {
                 let cmd = pane.command.clone();
@@ -4606,6 +4653,7 @@ impl App {
             &shell,
             history_budget_bytes,
             self.pane_appearance,
+            self.host_graphics.clone(),
         );
         let cmd = pane.command.clone();
         self.panes.insert(id, pane);
@@ -4639,6 +4687,7 @@ impl App {
                 a,
                 history_budget_bytes,
                 self.pane_appearance,
+                self.host_graphics.clone(),
             ),
             None => Pane::spawn(
                 id,
@@ -4650,6 +4699,7 @@ impl App {
                 &shell,
                 history_budget_bytes,
                 self.pane_appearance,
+                self.host_graphics.clone(),
             ),
         };
         match spawned {
@@ -7535,6 +7585,7 @@ pub(crate) fn worktree_membership(cwd: &std::path::Path) -> Option<crate::git::W
 
 /// Re-spawn a saved module pane if its module is still installed + runnable;
 /// returns the pane + its tracking record, or `None` to fall back to a shell.
+#[allow(clippy::too_many_arguments)]
 fn restore_module_pane(
     modules: &crate::module::ModuleRegistry,
     mid: &str,
@@ -7543,6 +7594,7 @@ fn restore_module_pane(
     app_tx: &Sender<AppEvent>,
     history_budget_bytes: usize,
     appearance: crate::terminal::appearance::PaneAppearance,
+    host_graphics: crate::terminal::graphics::HostGraphics,
 ) -> Option<(Pane, crate::module::ModulePaneRecord)> {
     let m = modules.find(mid).filter(|m| m.is_runnable())?;
     let argv = m
@@ -7567,6 +7619,7 @@ fn restore_module_pane(
         &env,
         history_budget_bytes,
         appearance,
+        host_graphics,
     )
     .ok()?;
     Some((
