@@ -2028,6 +2028,46 @@ mod tests {
         );
     }
 
+    /// A kitty graphics Unicode placeholder is ordinary text: the private-use
+    /// character `U+10EEEE` with its coordinates in combining marks and the
+    /// image id in a truecolor foreground. Nothing about it is special to the
+    /// grid, and that is exactly the property the whole approach rests on — the
+    /// cells scroll, clip, and reflow because they are text like any other.
+    #[test]
+    fn a_unicode_placeholder_survives_the_grid_as_one_cell_per_image_cell() {
+        let (tx, _rx) = channel();
+        let mut e = AlacrittyEngine::new(20, 3, tx, budget_for_rows(20, 20));
+        // Image id 42 as a 2x1 block, exactly as a client writes it.
+        e.advance(
+            "\x1b[38;2;0;0;42m\u{10eeee}\u{0305}\u{0305}\u{10eeee}\u{0305}\u{030d}\x1b[39m"
+                .as_bytes(),
+        );
+
+        let mut cells = Vec::new();
+        e.for_each_cell(&mut |row, col, symbol, cell| {
+            if symbol.starts_with('\u{10eeee}') {
+                cells.push((row, col, symbol.to_string(), cell.fg));
+            }
+        });
+
+        assert_eq!(cells.len(), 2, "one grid cell per image cell: {cells:?}");
+        assert_eq!(
+            (cells[0].0, cells[0].1, cells[1].0, cells[1].1),
+            (0, 0, 0, 1),
+            "the block occupies adjacent columns on one row"
+        );
+        assert_eq!(
+            cells[0].2, "\u{10eeee}\u{0305}\u{0305}",
+            "the coordinate diacritics must survive with the base character"
+        );
+        assert_eq!(cells[1].2, "\u{10eeee}\u{0305}\u{030d}");
+        assert_eq!(
+            cells[0].3,
+            Color::Rgb(0, 0, 42),
+            "the image id rides in the foreground color and must stay exact"
+        );
+    }
+
     /// The support probe every kitty-graphics client sends: a query action
     /// followed by DA1. Both must be answered, and the query must be answered
     /// first — a client that sees only the DA1 concludes "no graphics", which
