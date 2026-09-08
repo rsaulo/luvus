@@ -67,6 +67,7 @@ static CAUSE_API_MAINTENANCE: AtomicU64 = AtomicU64::new(0);
 static CAUSE_FORCED: AtomicU64 = AtomicU64::new(0);
 static CAUSE_RESYNC: AtomicU64 = AtomicU64::new(0);
 static CAUSE_ATTACH_RESIZE: AtomicU64 = AtomicU64::new(0);
+static CAUSE_GRAPHICS_DUE: AtomicU64 = AtomicU64::new(0);
 
 /// Process-lifetime frame counters for performance diagnostics.
 pub fn performance_snapshot() -> serde_json::Value {
@@ -99,6 +100,7 @@ pub fn performance_snapshot() -> serde_json::Value {
             "forced": CAUSE_FORCED.load(Ordering::Relaxed),
             "resync": CAUSE_RESYNC.load(Ordering::Relaxed),
             "client_attach_or_resize": CAUSE_ATTACH_RESIZE.load(Ordering::Relaxed),
+            "graphics_due": CAUSE_GRAPHICS_DUE.load(Ordering::Relaxed),
             "unclassified": 0,
         },
         "loop_wakes": {
@@ -118,6 +120,9 @@ enum RenderCause {
     ForcedRepair,
     ClientResync,
     ClientAttachOrResize,
+    /// Images owed to a client whose projection did not change. Answered
+    /// without a frame: the placeholder cells are already on screen.
+    GraphicsDue,
 }
 
 impl RenderCause {
@@ -135,6 +140,7 @@ impl RenderCause {
             Self::ForcedRepair => &CAUSE_FORCED,
             Self::ClientResync => &CAUSE_RESYNC,
             Self::ClientAttachOrResize => &CAUSE_ATTACH_RESIZE,
+            Self::GraphicsDue => &CAUSE_GRAPHICS_DUE,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -174,6 +180,11 @@ impl RenderRequest {
         self.causes == RenderCause::VisiblePty.bit()
     }
 
+    /// Only images are owed: nothing on screen changed, so no frame is due.
+    fn is_graphics_only(self) -> bool {
+        self.causes == RenderCause::GraphicsDue.bit()
+    }
+
     fn clear(&mut self) {
         *self = Self::default();
     }
@@ -182,6 +193,10 @@ impl RenderRequest {
 struct ClientSender {
     messages: Sender<ServerMessage>,
     frame_pending: Arc<AtomicBool>,
+    /// The graphics equivalent of `frame_pending`, for images this client is
+    /// owed while its projection is unchanged. Kept separate so a stalled
+    /// writer's graphics slot cannot consume the frame slot, and vice versa.
+    graphics_pending: Arc<AtomicBool>,
 }
 
 enum FrameSendError {
@@ -212,12 +227,97 @@ impl ClientSender {
         }
         Ok(())
     }
+
+    /// Claim the one frame slot without sending anything yet.
+    ///
+    /// A caller that has to know the frame will go out *before* it builds the
+    /// payload reserves first: emptying a client's graphics backlog into a
+    /// frame that is then refused would teach its terminal a new image while
+    /// its grid still holds the cells of the old one.
+    fn reserve_frame(&self) -> Result<(), FrameSendError> {
+        if self
+            .frame_pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(FrameSendError::Full);
+        }
+        Ok(())
+    }
+
+    /// Send the images a frame's cells refer to, then the frame itself.
+    ///
+    /// The images are only asked for once the slot is ours, which is what lets
+    /// a caller keep them when the frame is refused. They then ride the frame's
+    /// reservation rather than the graphics gate: FIFO order puts them ahead of
+    /// the frame, and that is the whole point — a terminal must never be shown
+    /// a placeholder for an image it has not been taught, nor be taught an
+    /// image before the cells that size it.
+    fn try_send_frame_with_graphics(
+        &self,
+        graphics: impl FnOnce() -> Vec<Vec<u8>>,
+        frame: ServerMessage,
+    ) -> Result<(), FrameSendError> {
+        self.reserve_frame()?;
+        let graphics = graphics();
+        if !graphics.is_empty()
+            && self
+                .messages
+                .send(ServerMessage::Graphics(graphics))
+                .is_err()
+        {
+            self.frame_pending.store(false, Ordering::Release);
+            return Err(FrameSendError::Disconnected);
+        }
+        if self.messages.send(frame).is_err() {
+            self.frame_pending.store(false, Ordering::Release);
+            return Err(FrameSendError::Disconnected);
+        }
+        Ok(())
+    }
+
+    /// Send images to a client whose projection did not change, through their
+    /// own one-message gate and with the same take-after-claim discipline.
+    fn try_send_graphics(
+        &self,
+        commands: impl FnOnce() -> Vec<Vec<u8>>,
+    ) -> Result<(), FrameSendError> {
+        if self
+            .graphics_pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(FrameSendError::Full);
+        }
+        if self
+            .messages
+            .send(ServerMessage::Graphics(commands()))
+            .is_err()
+        {
+            self.graphics_pending.store(false, Ordering::Release);
+            return Err(FrameSendError::Disconnected);
+        }
+        Ok(())
+    }
 }
 
 struct ClientState {
     sender: ClientSender,
     size: (u16, u16),
     terminal_colors: Option<crate::terminal::theme_probe::TerminalColors>,
+    /// Whether this client's terminal answered the kitty graphics query.
+    /// Unknown counts as no: painting image bytes at a terminal that cannot
+    /// draw them reaches the user as garbage.
+    graphics: bool,
+    /// Images this client's panes emitted and it has yet to be sent. Per
+    /// client, like its viewport and its diff baseline: a slow terminal must
+    /// not decide what a fast one is taught.
+    graphics_backlog: crate::terminal::graphics::GraphicsBacklog,
+    /// Whether this client still owes its panes' whole working set of images,
+    /// because its backlog overflowed. Held until a frame carrying them is
+    /// accepted: a refused frame must not consume the repair.
+    graphics_resync: bool,
+    cell_size: Option<crate::terminal::theme_probe::CellSize>,
     render_buf: Buffer,
     last_frame: Option<protocol::FrameData>,
     behind: bool,
@@ -241,6 +341,8 @@ impl ClientState {
         cols: u16,
         rows: u16,
         terminal_colors: Option<crate::terminal::theme_probe::TerminalColors>,
+        graphics: bool,
+        cell_size: Option<crate::terminal::theme_probe::CellSize>,
         last_activity: u64,
     ) -> Self {
         let size = (cols.max(1), rows.max(1));
@@ -248,6 +350,10 @@ impl ClientState {
             sender,
             size,
             terminal_colors,
+            graphics,
+            graphics_backlog: crate::terminal::graphics::GraphicsBacklog::default(),
+            graphics_resync: false,
+            cell_size,
             render_buf: Buffer::empty(Rect::new(0, 0, size.0, size.1)),
             last_frame: None,
             behind: false,
@@ -426,9 +532,15 @@ pub fn run() -> Result<()> {
         // Otherwise sleep until the next real deadline, or block on the
         // channel when nothing is due (PTY/API/client/signal wake the loop).
         let now = Instant::now();
-        let persist_due = (app.persist_session_now && !immediate_save_attempted)
-            || (app.session_dirty && last_save.elapsed() >= SESSION_SAVE_DEBOUNCE);
-        let rearm_due = app.has_pending_pty_output() && last_rearm.elapsed() >= REARM_INTERVAL;
+        let rearm_interval = if app.has_history_maintenance() {
+            Duration::from_millis(1)
+        } else {
+            REARM_INTERVAL
+        };
+        let persist_due = !app.session_save_inflight
+            && ((app.persist_session_now && !immediate_save_attempted)
+                || (app.session_dirty && last_save.elapsed() >= SESSION_SAVE_DEBOUNCE));
+        let rearm_due = app.has_pending_pty_output() && last_rearm.elapsed() >= rearm_interval;
         let received = if persist_due || rearm_due {
             // Already-due persist/re-arm must not `recv_timeout(0)`: that busy-loops
             // until the 100ms re-arm cadence elapses.
@@ -444,11 +556,11 @@ pub fn run() -> Result<()> {
             }
         } else {
             let mut deadline = app.next_runtime_deadline(now, !clients.is_empty());
-            if app.session_dirty {
+            if app.session_dirty && !app.session_save_inflight {
                 App::sooner_deadline(&mut deadline, last_save + SESSION_SAVE_DEBOUNCE);
             }
             if app.has_pending_pty_output() {
-                App::sooner_deadline(&mut deadline, last_rearm + REARM_INTERVAL);
+                App::sooner_deadline(&mut deadline, last_rearm + rearm_interval);
             }
             match deadline.map(|at| at.saturating_duration_since(now)) {
                 Some(timeout) if !timeout.is_zero() => match rx.recv_timeout(timeout) {
@@ -533,13 +645,9 @@ pub fn run() -> Result<()> {
         // retain both flags and retry at the normal cadence instead of hot-looping.
         let immediate_save_due = app.persist_session_now && !immediate_save_attempted;
         let debounced_save_due = app.session_dirty && last_save.elapsed() >= SESSION_SAVE_DEBOUNCE;
-        if immediate_save_due || debounced_save_due {
+        if !app.session_save_inflight && (immediate_save_due || debounced_save_due) {
             immediate_save_attempted = app.persist_session_now;
-            if persist::save(&app) {
-                app.persist_session_now = false;
-                app.session_dirty = false;
-                immediate_save_attempted = false;
-            }
+            app.schedule_session_save();
             last_save = Instant::now();
         }
         if app.detach_requested {
@@ -549,7 +657,7 @@ pub fn run() -> Result<()> {
                     let _ = c.send_control(ServerMessage::Detach);
                 }
                 foreground = latest_client(&clients);
-                apply_foreground_theme(&mut app, &clients, foreground);
+                apply_client_state(&mut app, &clients, foreground);
                 render_request.record(RenderCause::UserInterface);
             }
         }
@@ -559,7 +667,7 @@ pub fn run() -> Result<()> {
                     let _ = client.send_control(ServerMessage::SwitchSession { name });
                 }
                 foreground = latest_client(&clients);
-                apply_foreground_theme(&mut app, &clients, foreground);
+                apply_client_state(&mut app, &clients, foreground);
                 render_request.record(RenderCause::UserInterface);
             } else {
                 app.show_toast("no attached client to switch".to_string());
@@ -610,9 +718,12 @@ pub fn run() -> Result<()> {
         }
         // Fallback re-arm (the render path below re-arms at the frame rate): a
         // flag still set here means un-rendered output → schedule a frame.
-        if last_rearm.elapsed() >= REARM_INTERVAL {
+        if last_rearm.elapsed() >= rearm_interval {
             last_rearm = Instant::now();
-            let (visible, background) = app.rearm_pty_notify_by_visibility();
+            let (visible, background, title_changed) = app.rearm_pty_notify_by_visibility();
+            if title_changed {
+                render_request.record(RenderCause::Metadata);
+            }
             if visible {
                 render_request.record_visible_pty();
             }
@@ -623,13 +734,24 @@ pub fn run() -> Result<()> {
 
         // A forced redraw (resize / focus-regained / external damage) must render
         // even if nothing else changed this tick — and so must a client that is
-        // waiting on its full-frame resync (see `needs_render`).
+        // waiting on its full-frame resync (see `needs_render`). A client owed
+        // only images is not this case: its writer wakes the loop when its gate
+        // frees (`ClientGraphicsSent`), and the images go out without a frame.
         let any_behind = clients.values().any(|client| client.behind);
         if app.force_redraw {
             render_request.record(RenderCause::ForcedRepair);
         }
         if any_behind {
             render_request.record(RenderCause::ClientResync);
+        }
+
+        // Images owed to a client whose screen did not change need no frame:
+        // teach them and move on. Projecting the whole UI only to find the
+        // projection unchanged is what a streaming child would otherwise cost
+        // on every gate release.
+        if render_request.is_graphics_only() {
+            flush_graphics(&mut clients);
+            render_request.clear();
         }
 
         if render_request.needs_render()
@@ -651,7 +773,10 @@ pub fn run() -> Result<()> {
             // Re-arm the PTY readers now that their output is on screen. A flag
             // set during this frame = more output already waiting → stay dirty
             // so the burst keeps rendering at the frame cap, tail included.
-            let (visible, background) = app.rearm_pty_notify_by_visibility();
+            let (visible, background, title_changed) = app.rearm_pty_notify_by_visibility();
+            if title_changed {
+                render_request.record(RenderCause::Metadata);
+            }
             if visible {
                 render_request.record_visible_pty();
             }
@@ -661,7 +786,7 @@ pub fn run() -> Result<()> {
         }
     }
 
-    persist::save(&app);
+    app.finish_session_persistence();
     Ok(())
 }
 
@@ -679,9 +804,12 @@ fn apply(
             id,
             messages,
             frame_pending,
+            graphics_pending,
             cols,
             rows,
             terminal_colors,
+            terminal_graphics,
+            terminal_cell_size,
         } => {
             crate::logging::event(
                 crate::logging::EventKind::ServerClientAttach,
@@ -700,15 +828,27 @@ fn apply(
                     ClientSender {
                         messages,
                         frame_pending,
+                        graphics_pending,
                     },
                     cols,
                     rows,
                     terminal_colors,
+                    terminal_graphics.unwrap_or(false),
+                    terminal_cell_size,
                     activity,
                 ),
             );
             *foreground = Some(id);
-            apply_foreground_theme(app, clients, *foreground);
+            apply_client_state(app, clients, *foreground);
+            // The panes this client is about to be shown may already hold
+            // images, and their first frame carries the cells naming them.
+            // Teach this terminal those images before that frame goes out.
+            if let Some(client) = clients.get(&id).filter(|client| client.graphics) {
+                let history = app.pane_graphics_history();
+                if !history.is_empty() {
+                    let _ = client.sender.send_control(ServerMessage::Graphics(history));
+                }
+            }
             app.mark_runtime_scans_dirty();
             true
         }
@@ -724,9 +864,17 @@ fn apply(
             clients.remove(&id);
             if was_foreground {
                 *foreground = latest_client(clients);
-                apply_foreground_theme(app, clients, *foreground);
+                apply_client_state(app, clients, *foreground);
             }
             was_foreground
+        }
+        AppEvent::ClientGraphicsSent { id } => {
+            // Worth a pass only while images are still waiting. The common
+            // case is the gate freed by the very message that emptied the
+            // backlog, and that is not work.
+            clients
+                .get(&id)
+                .is_some_and(|client| !client.graphics_backlog.is_empty())
         }
         AppEvent::ClientInput { id, input } => {
             let Some(client) = clients.get_mut(&id) else {
@@ -757,7 +905,7 @@ fn apply(
             let promoted = *foreground != Some(id);
             if promoted {
                 *foreground = Some(id);
-                apply_foreground_theme(app, clients, *foreground);
+                apply_client_state(app, clients, *foreground);
             }
             let target_size = clients.get(&id).map(|client| client.size);
             if promoted || target_size.is_some_and(|size| size != *interactive_size) {
@@ -768,7 +916,7 @@ fn apply(
                 if disconnected {
                     clients.remove(&id);
                     *foreground = latest_client(clients);
-                    apply_foreground_theme(app, clients, *foreground);
+                    apply_client_state(app, clients, *foreground);
                     return true;
                 }
                 if let Some(size) = target_size {
@@ -801,7 +949,24 @@ fn latest_client(clients: &Clients) -> Option<u64> {
         .map(|(&id, _)| id)
 }
 
-fn apply_foreground_theme(app: &mut App, clients: &Clients, foreground: Option<u64>) {
+/// Re-derive the state that depends on which clients are attached.
+///
+/// Called at every point the client set changes, so a pane can never be left
+/// believing something about clients that have since come or gone.
+fn apply_client_state(app: &mut App, clients: &Clients, foreground: Option<u64>) {
+    // One drawing client is enough. Images are forwarded only to the clients
+    // that can render them, and the rest paint the placeholder cells as blanks,
+    // so a mixed set of clients stays correct either way.
+    app.set_host_graphics(clients.values().any(|client| client.graphics));
+    // A cell is the size the terminal in front of the user makes it. With more
+    // than one client attached the newest wins, the same rule the palette uses.
+    app.set_host_cell_size(
+        foreground
+            .and_then(|id| clients.get(&id))
+            .or_else(|| clients.values().next())
+            .and_then(|client| client.cell_size),
+    );
+
     if app.config.theme != "terminal" {
         return;
     }
@@ -823,6 +988,9 @@ enum EventRenderSource {
 fn event_render_source(app: &App, event: &AppEvent) -> EventRenderSource {
     match event {
         AppEvent::PtyData(id) if app.pane_is_visible(*id) => EventRenderSource::VisiblePty,
+        AppEvent::PtyData(id) if app.hidden_title_changed(*id) => {
+            EventRenderSource::Cause(RenderCause::Metadata)
+        }
         AppEvent::PtyData(_) => EventRenderSource::HiddenPty,
         AppEvent::ClientConnected { .. }
         | AppEvent::ClientInput {
@@ -830,6 +998,7 @@ fn event_render_source(app: &App, event: &AppEvent) -> EventRenderSource {
             ..
         } => EventRenderSource::Cause(RenderCause::ClientAttachOrResize),
         AppEvent::Api(_) => EventRenderSource::Cause(RenderCause::ApiOrMaintenance),
+        AppEvent::ClientGraphicsSent { .. } => EventRenderSource::Cause(RenderCause::GraphicsDue),
         _ => EventRenderSource::Cause(RenderCause::UserInterface),
     }
 }
@@ -846,6 +1015,23 @@ fn record_event_render_request(
         EventRenderSource::VisiblePty => request.record_visible_pty(),
         EventRenderSource::HiddenPty => request.record_hidden_pty(),
         EventRenderSource::Cause(cause) => request.record(cause),
+    }
+}
+
+/// Send the images waiting for clients whose screens did not change.
+///
+/// Reached when a writer freed a client's graphics gate while its backlog was
+/// not empty — the child kept streaming while the terminal was busy. The cells
+/// naming these images are already on screen, so no frame is owed; what this
+/// avoids is projecting the whole UI just to learn that. A gate still taken
+/// leaves the backlog where it is, coalesced, for the next release.
+fn flush_graphics(clients: &mut Clients) {
+    for client in clients.values_mut() {
+        if !client.graphics || client.graphics_backlog.is_empty() {
+            continue;
+        }
+        let backlog = &mut client.graphics_backlog;
+        let _ = client.sender.try_send_graphics(|| backlog.take());
     }
 }
 
@@ -878,7 +1064,7 @@ fn render_clients(
     }
     if foreground.is_none_or(|id| !clients.contains_key(&id)) {
         *foreground = latest_client(clients);
-        apply_foreground_theme(app, clients, *foreground);
+        apply_client_state(app, clients, *foreground);
     }
 
     let retained_client_ready = foreground
@@ -902,6 +1088,20 @@ fn render_clients(
             .damage
             .values()
             .all(|snapshot| snapshot.kind == crate::terminal::vt::DamageKind::Partial);
+
+    // Images the panes' children emitted since the last pass. Drained once and
+    // owed to every client that can draw. What actually goes out is decided per
+    // client below: sending an image here, ahead of the decision on its frame,
+    // is what left a backpressured terminal holding a new image and the old
+    // frame's placeholder cells — drawing it into the previous rectangle.
+    let graphics = app.take_pane_graphics();
+    if !graphics.is_empty() {
+        for client in clients.values_mut() {
+            if client.graphics {
+                client.graphics_backlog.push(&graphics);
+            }
+        }
+    }
 
     scratch.order.clear();
     scratch.order.extend(clients.keys().copied());
@@ -934,7 +1134,7 @@ fn render_clients(
     }
     if foreground.is_some_and(|id| !clients.contains_key(&id)) {
         *foreground = latest_client(clients);
-        apply_foreground_theme(app, clients, *foreground);
+        apply_client_state(app, clients, *foreground);
     }
     if partial_candidate {
         acknowledge_visible_terminal_damage(app, &mut scratch.damage);
@@ -1050,8 +1250,16 @@ fn render_client(
         client.retained_ready = false;
     }
 
+    // An overflowed backlog dropped commands, so nothing partial can repair it:
+    // this client is taught every image its panes still hold, and its next
+    // frame is a full one so the cells naming them arrive together with them.
+    // The request outlives a refused frame — it is only answered by a delivery.
+    if client.graphics_backlog.take_resync() {
+        client.force_full = true;
+        client.graphics_resync = true;
+    }
+
     let may_patch = partial_pass
-        && interactive
         && client.retained_ready
         && !client.force_full
         && !client.behind
@@ -1082,8 +1290,8 @@ fn render_client(
                 .clone_from(&app.pane_content_rects);
             client.retained_ready = true;
         } else {
-            ui::render_projection(&mut target, app);
-            client.retained_ready = false;
+            client.retained_pane_content = ui::render_projection(&mut target, app);
+            client.retained_ready = true;
         }
         (target.cursor(), target.cursor_visible())
     };
@@ -1125,14 +1333,50 @@ fn render_client(
 
     let Some(message) = message else {
         UNCHANGED_PROJECTIONS.fetch_add(1, Ordering::Relaxed);
-        return RenderClientOutcome::default();
+        // The steady case for a child that redraws one image: the placeholder
+        // cells are identical, so no frame is owed, but the terminal still has
+        // to be taught the new image or it keeps drawing the old one. Nothing
+        // is presented, so this is not a rendered frame. A resync cannot land
+        // here: it forces a full frame, and a full frame is never unchanged.
+        if client.graphics_backlog.is_empty() {
+            return RenderClientOutcome::default();
+        }
+        let backlog = &mut client.graphics_backlog;
+        let sent = client.sender.try_send_graphics(|| backlog.take());
+        return RenderClientOutcome {
+            enqueued: false,
+            disconnected: matches!(sent, Err(FrameSendError::Disconnected)),
+        };
     };
     CHANGED_PROJECTIONS.fetch_add(1, Ordering::Relaxed);
-    match client.sender.try_send_frame(message) {
+    // A client that cannot draw images never has a backlog, and takes the path
+    // it always did.
+    let sent = if client.graphics {
+        let backlog = &mut client.graphics_backlog;
+        let resync = client.graphics_resync;
+        client.sender.try_send_frame_with_graphics(
+            || {
+                // Walking the panes for their working set is worth doing only
+                // once the frame is certain to go out.
+                let mut commands = if resync {
+                    app.pane_graphics_history()
+                } else {
+                    Vec::new()
+                };
+                commands.append(&mut backlog.take());
+                commands
+            },
+            message,
+        )
+    } else {
+        client.sender.try_send_frame(message)
+    };
+    match sent {
         Ok(()) => {
             FRAMES_ENQUEUED.fetch_add(1, Ordering::Relaxed);
             client.behind = false;
             client.force_full = false;
+            client.graphics_resync = false;
             RenderClientOutcome {
                 enqueued: true,
                 disconnected: false,
@@ -1241,22 +1485,30 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
         return;
     }
 
-    let probe_terminal = terminal_theme.load(Ordering::Relaxed);
-    if protocol::write_message(&mut writer, &ServerMessage::Ready { probe_terminal }).is_err() {
+    // Only the virtual Terminal theme reads the palette, but every client is
+    // asked whether its terminal can draw images: that describes the terminal,
+    // not the theme, and a pane must not be told graphics are unavailable
+    // merely because the user picked a static theme.
+    let probe_colors = terminal_theme.load(Ordering::Relaxed);
+    if protocol::write_message(&mut writer, &ServerMessage::Ready { probe_colors }).is_err() {
         return;
     }
-    let terminal_colors = if probe_terminal {
+    let (terminal_colors, terminal_graphics, terminal_cell_size) =
         match protocol::read_message::<_, ClientMessage>(&mut reader) {
-            Ok(ClientMessage::TerminalColors(colors)) => colors,
+            Ok(ClientMessage::TerminalProbe {
+                colors,
+                graphics,
+                cell_size,
+            }) => (colors, graphics, cell_size),
             _ => return,
-        }
-    } else {
-        None
-    };
+        };
 
     let (message_tx, message_rx) = mpsc::channel::<ServerMessage>();
     let frame_pending = Arc::new(AtomicBool::new(false));
     let writer_frame_pending = frame_pending.clone();
+    let graphics_pending = Arc::new(AtomicBool::new(false));
+    let writer_graphics_pending = graphics_pending.clone();
+    let writer_app_tx = app_tx.clone();
     thread::spawn(move || {
         for msg in message_rx {
             let frame_stats = match &msg {
@@ -1268,6 +1520,16 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
                 // Match sync_channel(1): receiving frees the single frame slot,
                 // even while the socket write itself is still in progress.
                 writer_frame_pending.store(false, Ordering::Release);
+            }
+            if matches!(msg, ServerMessage::Graphics(_)) {
+                // The same for images. Graphics sent ahead of a frame rode the
+                // frame's slot and free a graphics slot nobody took, which
+                // costs at most one extra queued message and never a lost one.
+                writer_graphics_pending.store(false, Ordering::Release);
+                // Whatever piled up while the gate was taken is owed now. The
+                // loop is told so, rather than left to find out by rendering
+                // every tick until the gate happens to be free.
+                let _ = writer_app_tx.send(AppEvent::ClientGraphicsSent { id });
             }
             let stop = matches!(
                 msg,
@@ -1297,9 +1559,12 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
             id,
             messages: message_tx,
             frame_pending,
+            graphics_pending,
             cols,
             rows,
             terminal_colors,
+            terminal_graphics,
+            terminal_cell_size,
         })
         .is_err()
     {
@@ -1356,7 +1621,7 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
                 let _ = app_tx.send(AppEvent::ClientDetach { id });
                 break;
             }
-            Ok(ClientMessage::Hello { .. } | ClientMessage::TerminalColors(_)) => {}
+            Ok(ClientMessage::Hello { .. } | ClientMessage::TerminalProbe { .. }) => {}
         }
     }
 }
@@ -1558,9 +1823,10 @@ mod shutdown {
 mod tests {
     use super::ServerMessage;
     use super::{
-        apply, broadcast, frame_cadence_ready, frame_wait, record_event_render_request,
-        render_clients, ClientSender, ClientState, EventRenderSource, FrameSendError, RenderCause,
-        RenderRequest, RenderScratch, FRAME_INTERVAL,
+        apply, broadcast, flush_graphics, frame_cadence_ready, frame_wait,
+        record_event_render_request, render_clients, ClientSender, ClientState, Clients,
+        EventRenderSource, FrameSendError, RenderCause, RenderRequest, RenderScratch,
+        FRAME_INTERVAL,
     };
     use crate::app::App;
     use crate::event::{AppEvent, ClientInput};
@@ -1579,20 +1845,179 @@ mod tests {
         rows: u16,
         activity: u64,
     ) -> (ClientState, mpsc::Receiver<ServerMessage>) {
+        client(cols, rows, activity, false)
+    }
+
+    /// A client whose terminal answered the kitty graphics query, which is what
+    /// makes it eligible for the per-client image backlog.
+    fn drawing_client(
+        cols: u16,
+        rows: u16,
+        activity: u64,
+    ) -> (ClientState, mpsc::Receiver<ServerMessage>) {
+        client(cols, rows, activity, true)
+    }
+
+    fn client(
+        cols: u16,
+        rows: u16,
+        activity: u64,
+        graphics: bool,
+    ) -> (ClientState, mpsc::Receiver<ServerMessage>) {
         let (messages, rx) = mpsc::channel();
         (
             ClientState::new(
                 ClientSender {
                     messages,
                     frame_pending: Arc::new(AtomicBool::new(false)),
+                    graphics_pending: Arc::new(AtomicBool::new(false)),
                 },
                 cols,
                 rows,
+                None,
+                graphics,
                 None,
                 activity,
             ),
             rx,
         )
+    }
+
+    /// A writer freeing a client's graphics gate is the event that delivers a
+    /// backlog it held back — through the gate, without a frame, and without
+    /// projecting anything. The gate then holds until the writer dequeues.
+    #[test]
+    fn a_freed_graphics_gate_flushes_the_backlog_without_a_frame() {
+        let (mut client, rx) = drawing_client(20, 5, 1);
+        client
+            .graphics_backlog
+            .push(&[image("a=T,U=1,i=3,c=1,r=1,f=100;AAAA")]);
+        let mut clients: Clients = HashMap::from([(1, client)]);
+
+        let mut request = RenderRequest::default();
+        request.record(RenderCause::GraphicsDue);
+        assert!(
+            request.is_graphics_only(),
+            "images alone owe no frame, so no projection is due"
+        );
+
+        flush_graphics(&mut clients);
+        assert_eq!(received_images(&rx).len(), 1, "the backlog is sent as is");
+        assert!(clients[&1].graphics_backlog.is_empty());
+        assert!(rx.try_recv().is_err(), "nothing else was sent: no frame");
+
+        // Until the writer dequeues, the gate is taken: what arrives meanwhile
+        // waits in the backlog instead of queueing behind a stalled writer.
+        clients
+            .get_mut(&1)
+            .expect("client")
+            .graphics_backlog
+            .push(&[image("a=T,U=1,i=3,c=1,r=1,f=100;BBBB")]);
+        flush_graphics(&mut clients);
+        assert!(rx.try_recv().is_err(), "the gate is still taken");
+        assert!(
+            !clients[&1].graphics_backlog.is_empty(),
+            "a refused send keeps the image for the next release"
+        );
+
+        clients[&1]
+            .sender
+            .graphics_pending
+            .store(false, Ordering::Release);
+        flush_graphics(&mut clients);
+        assert_eq!(
+            received_images(&rx),
+            vec![image("a=T,U=1,i=3,c=1,r=1,f=100;BBBB")],
+            "the release delivers exactly what was held back"
+        );
+    }
+
+    /// One graphics command as a pane hands it over, APC wrapper included.
+    fn image(payload: &str) -> Vec<u8> {
+        let mut command = b"\x1b_G".to_vec();
+        command.extend_from_slice(payload.as_bytes());
+        command.extend_from_slice(b"\x1b\\");
+        command
+    }
+
+    fn received_images(rx: &mpsc::Receiver<ServerMessage>) -> Vec<Vec<u8>> {
+        match rx.recv_timeout(Duration::from_secs(1)).unwrap() {
+            ServerMessage::Graphics(commands) => commands,
+            _ => panic!("expected images"),
+        }
+    }
+
+    /// One drawing client watching one pane that holds one image.
+    struct Drawing {
+        _env: crate::persist::TestEnv,
+        app: App,
+        engine: Arc<std::sync::Mutex<dyn crate::terminal::vt::VtEngine>>,
+        clients: HashMap<u64, ClientState>,
+        rx: mpsc::Receiver<ServerMessage>,
+        foreground: Option<u64>,
+        interactive_size: (u16, u16),
+        scratch: RenderScratch,
+    }
+
+    impl Drawing {
+        fn render(&mut self) -> bool {
+            render_clients(
+                &mut self.app,
+                &mut self.clients,
+                &mut self.foreground,
+                &mut self.interactive_size,
+                false,
+                false,
+                &mut self.scratch,
+            )
+        }
+
+        fn client(&mut self) -> &mut ClientState {
+            self.clients.get_mut(&1).expect("the attached client")
+        }
+    }
+
+    /// A client whose panes hold one image, before its first frame — the state
+    /// every graphics test starts from.
+    fn app_with_an_image(name: &str) -> Drawing {
+        let env = crate::persist::test_env(name);
+        let (app_tx, _app_rx) = mpsc::channel();
+        let mut app = App::new(100, 30, app_tx).expect("app starts");
+        app.server_mode = true;
+        let focus = app.layout().focus;
+        let (response_tx, _response_rx) = mpsc::channel();
+        // Support is what makes the engine keep a command at all: a pane must
+        // not hold images for a terminal that cannot draw them.
+        let host_graphics = crate::terminal::graphics::HostGraphics::default();
+        host_graphics.set(true);
+        let engine = create_engine(
+            VtEngineKind::Alacritty,
+            100,
+            30,
+            response_tx,
+            4 * 1024 * 1024,
+            PaneAppearance::default(),
+            host_graphics,
+        );
+        app.panes.get_mut(&focus).expect("focused pane").engine = engine.clone();
+        // A virtual placement writes no cells of its own, so what the client
+        // owes is an image and never a changed projection.
+        engine
+            .lock()
+            .expect("engine lock")
+            .advance(b"\x1b_Ga=T,U=1,i=7,c=2,r=2,f=100;AAAA\x1b\\");
+
+        let (client, rx) = drawing_client(100, 30, 1);
+        Drawing {
+            _env: env,
+            app,
+            engine,
+            clients: HashMap::from([(1, client)]),
+            rx,
+            foreground: Some(1),
+            interactive_size: (100, 30),
+            scratch: RenderScratch::default(),
+        }
     }
 
     fn received_frame_size(rx: &mpsc::Receiver<ServerMessage>) -> (u16, u16) {
@@ -1604,11 +2029,151 @@ mod tests {
     }
 
     #[test]
+    fn hidden_agent_titles_present_once_including_coalesced_output() {
+        let _env = crate::persist::test_env("hidden-agent-title");
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(100, 30, tx).unwrap();
+        let hidden = app.layout().focus;
+        app.status.get_mut(&hidden).unwrap().agent = "claude".into();
+        let (tx, _rx) = mpsc::channel();
+        let engine = create_engine(
+            VtEngineKind::Alacritty,
+            100,
+            30,
+            tx,
+            4 * 1024 * 1024,
+            PaneAppearance::default(),
+            crate::terminal::graphics::HostGraphics::default(),
+        );
+        app.panes.get_mut(&hidden).unwrap().engine = engine.clone();
+        app.dispatch("tab.new", &serde_json::json!({})).unwrap();
+        assert!(!app.pane_is_visible(hidden));
+        app.config.layout.agent_title = true;
+
+        engine.lock().unwrap().advance(b"\x1b]2;reviewing\x07");
+        let source = super::event_render_source(&app, &AppEvent::PtyData(hidden));
+        let mut request = RenderRequest::default();
+        record_event_render_request(source, true, &mut request);
+        assert!(request.needs_render());
+        assert!(matches!(
+            source,
+            EventRenderSource::Cause(RenderCause::Metadata)
+        ));
+        engine
+            .lock()
+            .unwrap()
+            .advance(b"ordinary output\x1b]2;reviewing\x07");
+        assert!(matches!(
+            super::event_render_source(&app, &AppEvent::PtyData(hidden)),
+            EventRenderSource::HiddenPty
+        ));
+
+        // Output may arrive while the reader's notification is already set.
+        engine.lock().unwrap().advance(b"\x1b]2;finished\x07");
+        app.panes[&hidden].mark_data_pending_for_test();
+        assert!(app.rearm_pty_notify_by_visibility().2);
+        app.panes[&hidden].mark_data_pending_for_test();
+        assert!(!app.rearm_pty_notify_by_visibility().2);
+    }
+
+    #[test]
+    fn passive_retained_frames_match_full_projection_at_each_client_size() {
+        use ratatui::{buffer::Buffer, layout::Rect};
+        let _env = crate::persist::test_env("passive-retained-frames");
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(100, 30, tx).unwrap();
+        app.server_mode = true;
+        let pane = app.layout().focus;
+        let (tx, _rx) = mpsc::channel();
+        let engine = create_engine(
+            VtEngineKind::Alacritty,
+            100,
+            30,
+            tx,
+            4 * 1024 * 1024,
+            PaneAppearance::default(),
+            crate::terminal::graphics::HostGraphics::default(),
+        );
+        app.panes.get_mut(&pane).unwrap().engine = engine.clone();
+        let mut clients = HashMap::new();
+        let mut receivers = Vec::new();
+        for (id, cols, rows) in [(1, 100, 30), (2, 100, 30), (3, 60, 20)] {
+            let (client, rx) = display_client(cols, rows, id);
+            clients.insert(id, client);
+            receivers.push(rx);
+        }
+        let mut foreground = Some(1);
+        let mut size = (100, 30);
+        let mut scratch = RenderScratch::default();
+        render_clients(
+            &mut app,
+            &mut clients,
+            &mut foreground,
+            &mut size,
+            false,
+            false,
+            &mut scratch,
+        );
+        for rx in &receivers {
+            rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+        let geometry = app.pane_content_rects.clone();
+        let pty_size = app.panes[&pane].size();
+
+        for bytes in [
+            "界e\u{301} text",
+            "\rshort\x1b[K",
+            "\x1b]2;new title\x07!",
+            "\rnext",
+        ] {
+            for client in clients.values() {
+                client.sender.frame_pending.store(false, Ordering::Release);
+            }
+            engine.lock().unwrap().advance(bytes.as_bytes());
+            let partial_before = super::PARTIAL_TERMINAL_PROJECTIONS.load(Ordering::Relaxed);
+            render_clients(
+                &mut app,
+                &mut clients,
+                &mut foreground,
+                &mut size,
+                false,
+                true,
+                &mut scratch,
+            );
+            for rx in &receivers {
+                rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            }
+            if !bytes.contains("\x1b]2;") {
+                assert!(
+                    super::PARTIAL_TERMINAL_PROJECTIONS.load(Ordering::Relaxed)
+                        >= partial_before + 3,
+                    "all three clients must patch their own retained geometry"
+                );
+            }
+            for client in clients.values() {
+                let area = Rect::new(0, 0, client.size.0, client.size.1);
+                let mut expected = Buffer::empty(area);
+                let mut target = crate::ui::RenderTarget::new(&mut expected, area);
+                crate::ui::render_projection(&mut target, &mut app);
+                let cursor = (target.cursor(), target.cursor_visible());
+                assert_eq!(client.render_buf, expected, "client size {:?}", client.size);
+                let frame = client.last_frame.as_ref().unwrap();
+                assert_eq!((frame.cursor, frame.cursor_visible), cursor);
+                assert!(client.retained_ready);
+            }
+            assert_eq!(app.pane_content_rects, geometry);
+            assert_eq!(app.panes[&pane].size(), pty_size);
+            assert_eq!(app.layout().focus, pane);
+        }
+    }
+
+    #[test]
     fn visible_pty_only_frame_uses_retained_rows_after_full_baseline() {
         let _env = crate::persist::test_env("server-retained-terminal-rows");
         let (app_tx, _app_rx) = mpsc::channel();
         let mut app = App::new(100, 30, app_tx).expect("app starts");
         app.server_mode = true;
+        app.config.layout.agent_title = true;
         let focus = app.layout().focus;
         let (response_tx, _response_rx) = mpsc::channel();
         let engine = create_engine(
@@ -1618,6 +2183,7 @@ mod tests {
             response_tx,
             4 * 1024 * 1024,
             PaneAppearance::default(),
+            crate::terminal::graphics::HostGraphics::default(),
         );
         app.panes.get_mut(&focus).expect("focused pane").engine = engine.clone();
 
@@ -1695,6 +2261,161 @@ mod tests {
         assert!(!clients[&1].behind);
     }
 
+    /// The bug this whole path exists for. Sending an image to a client whose
+    /// frame was refused teaches its terminal a new picture while its grid
+    /// still holds the previous placement's cells — the terminal fits the new
+    /// image into the old rectangle and the user sees it shrunk, anchored
+    /// top-left, with the rest of the pane black. So the image waits.
+    #[test]
+    fn images_wait_for_the_frame_whose_cells_name_them() {
+        let mut drawing = app_with_an_image("server-graphics-backpressure");
+        assert!(drawing.render());
+        assert!(matches!(
+            drawing.rx.recv().unwrap(),
+            ServerMessage::Frame(_)
+        ));
+
+        // The writer never dequeued that frame, so the slot is still taken.
+        let redraw = image("a=T,U=1,i=7,c=2,r=2,f=100;NEXT");
+        drawing
+            .client()
+            .graphics_backlog
+            .push(std::slice::from_ref(&redraw));
+        drawing
+            .engine
+            .lock()
+            .expect("engine lock")
+            .advance(b"changed row");
+        assert!(!drawing.render());
+        assert!(drawing.clients[&1].behind);
+        assert!(
+            drawing.rx.try_recv().is_err(),
+            "no image may go out ahead of the frame that places it"
+        );
+        assert!(
+            !drawing.clients[&1].graphics_backlog.is_empty(),
+            "a refused frame leaves the images it owed waiting"
+        );
+
+        drawing.clients[&1]
+            .sender
+            .frame_pending
+            .store(false, Ordering::Release);
+        assert!(drawing.render());
+        assert_eq!(
+            received_images(&drawing.rx),
+            vec![redraw],
+            "the image goes out first, then the cells naming it"
+        );
+        assert!(matches!(
+            drawing.rx.recv().unwrap(),
+            ServerMessage::Frame(_)
+        ));
+        assert!(drawing.clients[&1].graphics_backlog.is_empty());
+        assert!(!drawing.clients[&1].behind);
+    }
+
+    /// The steady case once identical placements stop rewriting cells: the
+    /// image changes and the grid does not. No frame is owed, but the terminal
+    /// still has to be taught the new image or it keeps drawing the old one.
+    #[test]
+    fn an_unchanged_projection_still_delivers_the_images_it_owes() {
+        let mut drawing = app_with_an_image("server-graphics-unchanged");
+        assert!(drawing.render());
+        assert!(matches!(
+            drawing.rx.recv().unwrap(),
+            ServerMessage::Frame(_)
+        ));
+        drawing.clients[&1]
+            .sender
+            .frame_pending
+            .store(false, Ordering::Release);
+
+        let first = image("a=T,U=1,i=7,c=2,r=2,f=100;ONE");
+        drawing
+            .client()
+            .graphics_backlog
+            .push(std::slice::from_ref(&first));
+        assert!(!drawing.render(), "images are not a presented frame");
+        assert_eq!(received_images(&drawing.rx), vec![first]);
+        assert!(
+            drawing.clients[&1]
+                .sender
+                .graphics_pending
+                .load(Ordering::Acquire),
+            "the graphics slot is held until the writer dequeues"
+        );
+
+        // A stalled writer must not build a queue: while its slot is taken the
+        // images pile up in the backlog, where one command per id survives.
+        for body in ["TWO", "THREE"] {
+            let next = image(&format!("a=T,U=1,i=7,c=2,r=2,f=100;{body}"));
+            drawing.client().graphics_backlog.push(&[next]);
+        }
+        assert!(!drawing.render());
+        assert!(
+            drawing.rx.try_recv().is_err(),
+            "the one graphics slot is full"
+        );
+
+        drawing.clients[&1]
+            .sender
+            .graphics_pending
+            .store(false, Ordering::Release);
+        assert!(!drawing.render());
+        assert_eq!(
+            received_images(&drawing.rx),
+            vec![image("a=T,U=1,i=7,c=2,r=2,f=100;THREE")],
+            "an id names one image, and it is the one the pane shows now"
+        );
+        assert!(drawing.clients[&1].graphics_backlog.is_empty());
+    }
+
+    /// An overflowed backlog dropped commands, and a transfer means nothing in
+    /// halves. The client is taught every image its panes still hold, and the
+    /// full frame that follows carries the cells naming them.
+    #[test]
+    fn an_overflowed_backlog_teaches_the_panes_images_again() {
+        let mut drawing = app_with_an_image("server-graphics-resync");
+        assert!(drawing.render());
+        assert!(matches!(
+            drawing.rx.recv().unwrap(),
+            ServerMessage::Frame(_)
+        ));
+
+        let backlog = &mut drawing.client().graphics_backlog;
+        let mut images = 0;
+        while images == 0 || !backlog.is_empty() {
+            images += 1;
+            assert!(images < 4096, "the backlog must bound itself");
+            backlog.push(&[image(&format!("a=T,U=1,i={images},c=1,r=1,f=100;AAAA"))]);
+        }
+
+        // The writer is still busy with the first frame. A refused frame must
+        // not consume the repair, or the client would keep its full frame and
+        // never be taught the images its cells name.
+        assert!(!drawing.render());
+        assert!(
+            drawing.rx.try_recv().is_err(),
+            "nothing goes out while the frame slot is taken"
+        );
+        drawing.clients[&1]
+            .sender
+            .frame_pending
+            .store(false, Ordering::Release);
+
+        assert!(drawing.render());
+        assert_eq!(
+            received_images(&drawing.rx),
+            vec![image("a=T,U=1,i=7,c=2,r=2,f=100;AAAA")],
+            "every image the panes still hold, not the abandoned backlog"
+        );
+        assert!(
+            matches!(drawing.rx.recv().unwrap(), ServerMessage::Frame(_)),
+            "and a whole frame, because the cells have to arrive with them"
+        );
+    }
+
     #[test]
     fn hidden_pty_activity_does_not_request_presentation() {
         let mut request = RenderRequest::default();
@@ -1748,9 +2469,12 @@ mod tests {
             ClientSender {
                 messages,
                 frame_pending: Arc::new(AtomicBool::new(false)),
+                graphics_pending: Arc::new(AtomicBool::new(false)),
             },
             120,
             32,
+            None,
+            false,
             None,
             1,
         );
@@ -1802,6 +2526,7 @@ mod tests {
         let client = ClientSender {
             messages,
             frame_pending: Arc::new(AtomicBool::new(false)),
+            graphics_pending: Arc::new(AtomicBool::new(false)),
         };
         assert!(client
             .try_send_frame(ServerMessage::FrameDiff(FrameDiff {

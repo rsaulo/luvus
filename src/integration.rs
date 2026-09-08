@@ -853,7 +853,8 @@ mod tests {
         match old_tui {
             Some(value) => std::env::set_var("OPENCODE_TUI_CONFIG", value),
             None => std::env::remove_var("OPENCODE_TUI_CONFIG"),
-        }        let _ = fs::remove_dir_all(&tmp);
+        }
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]

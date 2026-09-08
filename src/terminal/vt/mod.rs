@@ -165,6 +165,7 @@ pub(crate) fn create_engine(
     resp_tx: impl Into<InputSender>,
     history_budget_bytes: usize,
     appearance: PaneAppearance,
+    host_graphics: crate::terminal::graphics::HostGraphics,
 ) -> Arc<Mutex<dyn VtEngine>> {
     let resp_tx = resp_tx.into();
     match kind {
@@ -175,6 +176,7 @@ pub(crate) fn create_engine(
                 resp_tx,
                 history_budget_bytes,
                 appearance,
+                host_graphics,
             )))
         }
     }
@@ -266,6 +268,18 @@ pub struct HistoryMetrics {
     pub compacted_rows: Option<usize>,
     /// Physical cell slots allocated by the engine, excluding logical repeats.
     pub allocated_cells: Option<usize>,
+    /// Cold-history blocks shared by packed rows.
+    pub packed_blocks: Option<usize>,
+    /// Shallow bytes owned by packed cold-history blocks.
+    pub packed_bytes: Option<usize>,
+    /// Rows backed by packed cold-history blocks.
+    pub packed_rows: Option<usize>,
+    /// Shallow bytes owned by ordinary dense row cell vectors.
+    pub dense_row_bytes: Option<usize>,
+    /// Bytes reserved by the outer row descriptor vectors.
+    pub row_descriptor_bytes: Option<usize>,
+    /// Approximate number of outer, row, and block allocations.
+    pub allocation_count: Option<usize>,
     pub exact_bytes: bool,
 }
 
@@ -306,10 +320,21 @@ pub trait VtEngine: Send {
     /// Feed child output. Must never panic on arbitrary bytes.
     fn advance(&mut self, bytes: &[u8]);
 
-    /// Finish allocation maintenance deferred while parsing the latest output
-    /// burst. Called at the app's coalesced frame boundary, outside the PTY
-    /// reader path.
+    /// Finish allocation maintenance deferred while parsing recent output.
+    /// Unix calls this from its existing descriptor actor after a bounded
+    /// activity window; Windows uses the app's coalesced output boundary.
     fn finish_output_batch(&mut self);
+
+    /// Incremental maintenance. True requests another bounded turn; false
+    /// means no backlog. Engines without deferred work keep the full boundary.
+    fn finish_output_batch_step(&mut self) -> bool {
+        self.finish_output_batch();
+        false
+    }
+
+    fn history_maintenance_pending(&self) -> bool {
+        false
+    }
 
     /// Monotonic generation of successfully parsed terminal output.
     fn output_generation(&self) -> u64;
@@ -332,6 +357,8 @@ pub trait VtEngine: Send {
 
     /// Capture owned visible rows affected since the last acknowledged render.
     /// Implementations may conservatively return [`DamageKind::Full`].
+    /// Title changes must return Full until acknowledged: titles can also
+    /// affect chrome outside terminal rows, including agent sidebar labels.
     fn damage_snapshot(&mut self) -> DamageSnapshot;
 
     /// Forget damage through `generation` only when no newer output exists.
@@ -377,8 +404,44 @@ pub trait VtEngine: Send {
         max_bytes: usize,
     ) -> crate::terminal::backend::CaptureResult;
 
+    /// Take the kitty graphics commands this pane's child emitted since the
+    /// last call, for the clients whose terminals can draw them.
+    ///
+    /// The bytes are opaque and are forwarded verbatim: they teach a terminal
+    /// an image without saying where it goes. Position comes from the
+    /// placeholder cells the child writes into the grid, which travel in the
+    /// ordinary frame. Callers must therefore send these *before* the frame
+    /// they belong to, or a terminal is asked to draw an image it has not been
+    /// given yet.
+    fn take_graphics(&mut self) -> Vec<Vec<u8>> {
+        Vec::new()
+    }
+
+    /// Whether [`Self::take_graphics`] would return anything, without taking it.
+    fn has_graphics(&self) -> bool {
+        false
+    }
+
+    /// The images this pane's grid still refers to, for a terminal that has
+    /// never been told about them.
+    ///
+    /// A pane outlives the clients watching it, and the placeholder cells left
+    /// in its grid name images by id. A client attaching later is sent those
+    /// cells in its first frame, so it has to be sent these first or it is
+    /// asked to draw an image it never received. Unlike [`Self::take_graphics`]
+    /// this takes nothing away: the next client to attach needs them too.
+    fn retained_graphics(&self) -> Vec<Vec<u8>> {
+        Vec::new()
+    }
+
     /// Latest window title set by the child via OSC 0/2, if any.
     fn title(&self) -> Option<String>;
+
+    /// Changes only when title chrome changes, including reset. Engines with
+    /// mutable titles must override this for hidden-pane presentation.
+    fn title_generation(&self) -> u64 {
+        0
+    }
 
     /// Scroll the viewport `delta` lines through scrollback: **positive scrolls
     /// up into history**, negative back toward the live bottom. Clamped to the
@@ -504,6 +567,7 @@ mod tests {
             tx,
             64 * 1024,
             PaneAppearance::default(),
+            crate::terminal::graphics::HostGraphics::default(),
         );
         let mut engine = engine.lock().expect("engine lock");
         engine.advance(b"hi");

@@ -23,20 +23,25 @@ use crate::terminal::pty::Pane;
 use crate::ui::theme::{State, Theme};
 
 mod automation;
+mod automation_persistence;
 mod backend;
 mod board;
+mod config_persistence;
 mod cwd;
 pub use board::{
     agent_choices, automation_agent_choices, automation_agent_choices_for, task_agent_choices,
 };
 pub(crate) mod diff;
 mod dispatch;
+mod file_jobs;
 pub(crate) mod files;
 mod git;
 mod input;
+pub(crate) mod io_jobs;
 mod keys;
 mod mission;
 mod modules;
+mod persistence;
 mod picker;
 mod preview;
 mod search;
@@ -56,6 +61,9 @@ pub use settings::{
 
 /// How recently a pane must have produced PTY output to read as *raw* Working.
 const ACTIVITY_WINDOW: Duration = Duration::from_millis(700);
+
+/// Shared paste-to-Enter settling policy for direct and DIFF agent messages.
+const AGENT_MESSAGE_SETTLE: Duration = Duration::from_millis(45);
 
 /// Anti-jitter dwell: how long a pane must stay *quiet* before its published
 /// status is allowed to fall back to Idle/Done. Agents stream in bursts — a
@@ -1145,6 +1153,7 @@ const TASK_MANUAL_FIELDS: &[OrchFormField] = &[
     OrchFormField::Deps,
     OrchFormField::Gate,
     OrchFormField::Start,
+    OrchFormField::Prompt,
 ];
 const TASK_NOW_FIELDS: &[OrchFormField] = &[
     OrchFormField::Title,
@@ -1471,8 +1480,15 @@ impl OrchForm {
             self.schedule.clear();
             self.schedule_prefilled = false;
         }
+        let limit = match self.field {
+            OrchFormField::Title => Some(crate::orch::MAX_TASK_TITLE_BYTES),
+            OrchFormField::Prompt => Some(crate::orch::MAX_TASK_PROMPT_BYTES),
+            _ => None,
+        };
         if let Some(field) = self.active_mut() {
-            field.push(value);
+            if limit.is_none_or(|limit| field.len() + value.len_utf8() <= limit) {
+                field.push(value);
+            }
         }
     }
 
@@ -2130,6 +2146,10 @@ pub struct App {
     pub theme: Theme,
     /// Appearance reported to programs running inside panes.
     pane_appearance: crate::terminal::appearance::PaneAppearance,
+    /// Whether any attached client's terminal can draw images. Shared with
+    /// every pane's engine, which answers the kitty graphics support query
+    /// synchronously while parsing child output.
+    host_graphics: crate::terminal::graphics::HostGraphics,
     /// Last foreground-client palette used to resolve the virtual Terminal theme.
     probed_appearance: Option<crate::terminal::appearance::PaneAppearance>,
     /// Built-in, installed, and virtual themes in Settings display order.
@@ -2143,6 +2163,13 @@ pub struct App {
     /// This server's last local config snapshot. Persistence diffs against this
     /// snapshot so another named server's newer, unrelated fields survive.
     config_baseline: crate::config::Config,
+    config_persistence: config_persistence::ConfigPersistence,
+    io_jobs: io_jobs::IoJobs,
+    automation_persistence: automation_persistence::AutomationPersistence,
+    file_metadata_inflight: bool,
+    file_metadata_cursor: usize,
+    file_mutation_inflight: bool,
+    pub(crate) session_save_inflight: bool,
     /// Active `key → Cmd` map for prefix mode (defaults + config overrides).
     pub keymap: std::collections::HashMap<String, Cmd>,
     /// Explicit normal-mode shortcuts. Empty by default so pane input remains
@@ -2433,6 +2460,9 @@ pub struct App {
     last_proc_at: Instant,
     /// CWD/git follow-up is scheduled from PTY activity, not a 1s heartbeat.
     runtime_cwd_dirty: bool,
+    /// Ordinary output dirties its tab only. The boolean above remains the
+    /// full-invalidation path for attach, restore, and topology changes.
+    runtime_cwd_dirty_panes: HashSet<PaneId>,
     /// Attached PTY activity dirties process identity without creating a heartbeat.
     runtime_proc_dirty: bool,
     /// Resumable-session disk scans run on attach/demand, not a 4s walk.
@@ -2759,6 +2789,7 @@ impl App {
         let theme_registry = crate::theme::ThemeRegistry::load();
         let theme = theme_registry.theme_or_default(&config.theme);
         let pane_appearance = child_appearance(&theme_registry, &config.theme, &theme, None);
+        let host_graphics = crate::terminal::graphics::HostGraphics::default();
         let catalog = crate::i18n::by_code(&config.language);
         let sidebars = Sidebars::from_config(&config.sidebars());
         let shell = crate::platform::resolve_shell(&config.shell);
@@ -2780,6 +2811,7 @@ impl App {
             &shell,
             config.scrollback_bytes(),
             pane_appearance,
+            host_graphics.clone(),
         )?;
         let command = pane.command.clone();
         let mut panes = HashMap::new();
@@ -2821,11 +2853,19 @@ impl App {
             closed_workspace_paths: Vec::new(),
             theme,
             pane_appearance,
+            host_graphics,
             probed_appearance: None,
             theme_registry,
             catalog,
             config,
             config_baseline,
+            config_persistence: config_persistence::ConfigPersistence::default(),
+            io_jobs: io_jobs::IoJobs::default(),
+            automation_persistence: automation_persistence::AutomationPersistence::default(),
+            file_metadata_inflight: false,
+            file_metadata_cursor: 0,
+            file_mutation_inflight: false,
+            session_save_inflight: false,
             keymap,
             direct_keymap,
             prefix,
@@ -2944,6 +2984,7 @@ impl App {
             usage_scan_inflight: false,
             last_proc_at: Instant::now(),
             runtime_cwd_dirty: false,
+            runtime_cwd_dirty_panes: HashSet::new(),
             runtime_proc_dirty: false,
             runtime_sessions_dirty: false,
             last_detect_at: Instant::now()
@@ -3112,6 +3153,7 @@ impl App {
         let theme_registry = crate::theme::ThemeRegistry::load();
         let theme = theme_registry.theme_or_default(&config.theme);
         let pane_appearance = child_appearance(&theme_registry, &config.theme, &theme, None);
+        let host_graphics = crate::terminal::graphics::HostGraphics::default();
         let keymap = keys::build_keymap(&config.keybindings);
         let direct_keymap = keys::build_direct_keymap(&config.direct_keybindings);
         let prefix = keys::PrefixSpec::parse(&config.prefix).unwrap_or_default();
@@ -3308,6 +3350,7 @@ impl App {
                             &app_tx,
                             history_budget_bytes,
                             pane_appearance,
+                            host_graphics.clone(),
                         )
                     });
                     let (pane, module_rec) = match restored {
@@ -3341,6 +3384,7 @@ impl App {
                                     argv,
                                     history_budget_bytes,
                                     pane_appearance,
+                                    host_graphics.clone(),
                                 )
                                 .ok(),
                                 None => Some(Pane::spawn_restored(
@@ -3354,6 +3398,7 @@ impl App {
                                     &shell,
                                     history_budget_bytes,
                                     pane_appearance,
+                                    host_graphics.clone(),
                                 )),
                             };
                             let Some(pane) = pane else {
@@ -3464,11 +3509,19 @@ impl App {
             closed_workspace_paths,
             theme,
             pane_appearance,
+            host_graphics,
             probed_appearance: None,
             theme_registry,
             catalog,
             config,
             config_baseline,
+            config_persistence: config_persistence::ConfigPersistence::default(),
+            io_jobs: io_jobs::IoJobs::default(),
+            automation_persistence: automation_persistence::AutomationPersistence::default(),
+            file_metadata_inflight: false,
+            file_metadata_cursor: 0,
+            file_mutation_inflight: false,
+            session_save_inflight: false,
             keymap,
             direct_keymap,
             prefix,
@@ -3587,6 +3640,7 @@ impl App {
             usage_scan_inflight: false,
             last_proc_at: Instant::now(),
             runtime_cwd_dirty: false,
+            runtime_cwd_dirty_panes: HashSet::new(),
             runtime_proc_dirty: false,
             runtime_sessions_dirty: false,
             last_detect_at: Instant::now()
@@ -3741,6 +3795,69 @@ impl App {
         }
     }
 
+    /// Record whether any attached client's terminal can draw images.
+    ///
+    /// Every pane's engine shares this one value, so a child that asks the
+    /// kitty graphics support question mid-parse is answered against the
+    /// clients attached at that instant.
+    pub fn set_host_graphics(&mut self, supported: bool) {
+        self.host_graphics.set(supported);
+    }
+
+    /// Whether an image a pane's child emits would reach a screen right now.
+    pub fn host_graphics_available(&self) -> bool {
+        self.host_graphics.supported()
+    }
+
+    /// Record how big a cell is on the terminal showing the attached clients.
+    ///
+    /// A pane reports its size in pixels as well as in cells, and that pixel
+    /// figure is derived from this. It only changes when the set of attached
+    /// clients does, so the panes are told once rather than on every frame.
+    pub fn set_host_cell_size(
+        &mut self,
+        cell_size: Option<crate::terminal::theme_probe::CellSize>,
+    ) {
+        if !self.host_graphics.set_cell_size(cell_size) {
+            return;
+        }
+        for pane in self.panes.values() {
+            pane.refresh_window_size();
+        }
+    }
+
+    /// Take the kitty graphics commands every pane has waiting.
+    ///
+    /// Returns nothing, without touching a pane, unless one of them signalled
+    /// that it queued something — a render pass runs constantly and must not
+    /// lock every engine to discover there is no image.
+    pub fn take_pane_graphics(&mut self) -> Vec<Vec<u8>> {
+        if !self.host_graphics.take_pending() {
+            return Vec::new();
+        }
+        let mut commands = Vec::new();
+        for pane in self.panes.values() {
+            if let Ok(mut engine) = pane.engine.lock() {
+                if engine.has_graphics() {
+                    commands.append(&mut engine.take_graphics());
+                }
+            }
+        }
+        commands
+    }
+
+    /// The images every pane's grid still refers to, for a client that has just
+    /// attached and is about to be sent cells naming them.
+    pub fn pane_graphics_history(&self) -> Vec<Vec<u8>> {
+        let mut commands = Vec::new();
+        for pane in self.panes.values() {
+            if let Ok(engine) = pane.engine.lock() {
+                commands.append(&mut engine.retained_graphics());
+            }
+        }
+        commands
+    }
+
     /// Apply colors reported by the terminal displaying the foreground client.
     pub fn apply_terminal_colors(&mut self, colors: &crate::terminal::theme_probe::TerminalColors) {
         self.probed_appearance =
@@ -3799,29 +3916,6 @@ impl App {
         self.config.sidebars = Some(self.sidebars.to_config());
         self.config.sidebar_width = self.sidebars.left.width;
         self.persist_config();
-    }
-
-    /// Merge only this server's local changes into the shared home-level config.
-    /// A failed best-effort write keeps the old baseline so the next mutation
-    /// retries every unsaved field.
-    pub(crate) fn persist_config(&mut self) {
-        if crate::config::save_changes(&self.config_baseline, &self.config) {
-            self.config_baseline = self.config.clone();
-        }
-    }
-
-    /// Persist local changes while forcing an explicit user/API patch even when
-    /// this server already held the requested value in memory.
-    pub(crate) fn persist_config_patch(&mut self, patch: &serde_json::Value) {
-        if crate::config::save_changes_with_patch(&self.config_baseline, &self.config, Some(patch))
-        {
-            self.config_baseline = self.config.clone();
-        }
-    }
-
-    /// Adopt an externally reloaded config without writing it back to disk.
-    pub(crate) fn reset_config_baseline(&mut self) {
-        self.config_baseline = self.config.clone();
     }
 
     /// Apply the AGENTS All / Active projection without performing I/O. This is
@@ -4386,7 +4480,7 @@ impl App {
     /// active tab from output owned by another tab or workspace. The server
     /// uses this to keep focused rendering responsive without repeatedly
     /// diffing an unchanged UI for background-only bursts.
-    pub fn rearm_pty_notify_by_visibility(&self) -> (bool, bool) {
+    pub fn rearm_pty_notify_by_visibility(&self) -> (bool, bool, bool) {
         let layout = self.workspaces.get(self.active_ws).and_then(|workspace| {
             workspace
                 .tabs
@@ -4395,6 +4489,7 @@ impl App {
         });
         let mut visible = false;
         let mut background = false;
+        let mut title_changed = false;
         for (id, pane) in &self.panes {
             if !pane.take_data_pending() {
                 continue;
@@ -4403,14 +4498,30 @@ impl App {
                 visible = true;
             } else {
                 background = true;
+                title_changed |= self.hidden_title_changed(*id);
             }
         }
-        (visible, background)
+        (visible, background, title_changed)
+    }
+
+    pub(crate) fn hidden_title_changed(&self, id: PaneId) -> bool {
+        self.config.layout.agent_title
+            && self.is_agent_pane(id)
+            && self
+                .panes
+                .get(&id)
+                .is_some_and(|pane| pane.take_title_change())
     }
 
     /// Whether any PTY reader is currently coalescing an output notification.
     pub fn has_pending_pty_output(&self) -> bool {
         self.panes.values().any(|pane| pane.has_data_pending())
+    }
+
+    pub(crate) fn has_history_maintenance(&self) -> bool {
+        self.panes
+            .values()
+            .any(|pane| pane.has_history_maintenance())
     }
 
     /// Whether a pane is rendered in the active tab.
@@ -4519,6 +4630,7 @@ impl App {
             &shell,
             history_budget_bytes,
             self.pane_appearance,
+            self.host_graphics.clone(),
         ) {
             Ok(pane) => {
                 let cmd = pane.command.clone();
@@ -4574,6 +4686,7 @@ impl App {
             &shell,
             history_budget_bytes,
             self.pane_appearance,
+            self.host_graphics.clone(),
         );
         let cmd = pane.command.clone();
         self.panes.insert(id, pane);
@@ -4607,6 +4720,7 @@ impl App {
                 a,
                 history_budget_bytes,
                 self.pane_appearance,
+                self.host_graphics.clone(),
             ),
             None => Pane::spawn(
                 id,
@@ -4618,6 +4732,7 @@ impl App {
                 &shell,
                 history_budget_bytes,
                 self.pane_appearance,
+                self.host_graphics.clone(),
             ),
         };
         match spawned {
@@ -6794,13 +6909,12 @@ impl App {
     /// which for a stacked pane lands exactly on the horizontal divider. Resize
     /// must yield there, or the divider grab zone swallows every click on the ✕
     /// and the pane can't be closed by mouse.
-    /// True if `(c, r)` lands on a pane's interactive **border chrome**: a title
-    /// strip (the command-inspector button), the ⤢/⤡ zoom toggle, or the ✕ close
-    /// button. These live on the top border row — exactly the cells a resize grab
-    /// band would otherwise swallow — so every resize path (grab, Ctrl-grab, hover
-    /// highlight) excludes them: the seam between panes stays grabbable, but a
-    /// click on a title or button always wins. On a stacked split this matters
-    /// most, since the divider line *is* the lower pane's top border.
+    /// True if `(c, r)` lands on pane **border chrome**: a title strip, the ⤢/⤡
+    /// zoom toggle, or the ✕ close button. These live on the top border row,
+    /// exactly where a resize grab band would otherwise claim the press, so every
+    /// resize path excludes them. A title click can then focus its pane without
+    /// unexpectedly starting a resize. On a stacked split this matters most,
+    /// since the divider line is the lower pane's top border.
     fn on_pane_chrome(&self, c: u16, r: u16) -> bool {
         fn hit(rc: Rect, c: u16, r: u16) -> bool {
             c >= rc.x && c < rc.right() && r >= rc.y && r < rc.bottom()
@@ -6812,10 +6926,8 @@ impl App {
 
     pub fn begin_resize(&mut self, c: u16, r: u16) -> bool {
         // Pane border chrome (title, ⤢ zoom, ✕ close) always wins the click, even
-        // though it sits on the seam a resize would otherwise grab — see
-        // `on_pane_chrome`. This is what makes those buttons and the title
-        // clickable on a stacked split, where the divider line lands on the lower
-        // pane's top border row.
+        // though it sits on the seam a resize would otherwise grab. This keeps
+        // title focus and the two buttons reliable on stacked splits.
         if self.active_is_git() || self.active_is_orch() || self.on_pane_chrome(c, r) {
             return false;
         }
@@ -7006,7 +7118,8 @@ impl App {
         // drag instead of breaking the invariant.
         if pair < MIN_DOCK_HEIGHT.saturating_mul(2) {
             return;
-        }        let top = dividers[index];
+        }
+        let top = dividers[index];
         let start = top.saturating_sub(heights[index]);
         let want = r.saturating_sub(start);
         let max = pair.saturating_sub(MIN_DOCK_HEIGHT);
@@ -7033,7 +7146,8 @@ impl App {
             return Vec::new();
         };
         let mut heights = Vec::with_capacity(n);
-        let mut y = seam.y.saturating_add(crate::ui::SIDEBAR_CHROME_ROWS);        for i in 0..n {
+        let mut y = seam.y.saturating_add(crate::ui::SIDEBAR_CHROME_ROWS);
+        for i in 0..n {
             let end = dividers.get(i).copied().unwrap_or(seam.bottom());
             heights.push(end.saturating_sub(y));
             y = end.saturating_add(1);
@@ -7504,6 +7618,7 @@ pub(crate) fn worktree_membership(cwd: &std::path::Path) -> Option<crate::git::W
 
 /// Re-spawn a saved module pane if its module is still installed + runnable;
 /// returns the pane + its tracking record, or `None` to fall back to a shell.
+#[allow(clippy::too_many_arguments)]
 fn restore_module_pane(
     modules: &crate::module::ModuleRegistry,
     mid: &str,
@@ -7512,6 +7627,7 @@ fn restore_module_pane(
     app_tx: &Sender<AppEvent>,
     history_budget_bytes: usize,
     appearance: crate::terminal::appearance::PaneAppearance,
+    host_graphics: crate::terminal::graphics::HostGraphics,
 ) -> Option<(Pane, crate::module::ModulePaneRecord)> {
     let m = modules.find(mid).filter(|m| m.is_runnable())?;
     let argv = m
@@ -7536,6 +7652,7 @@ fn restore_module_pane(
         &env,
         history_budget_bytes,
         appearance,
+        host_graphics,
     )
     .ok()?;
     Some((
@@ -7925,6 +8042,8 @@ mod tests {
 
         alpha.apply_theme("quattro-rally");
         assert!(beta.set_agents_filter(true));
+        alpha.flush_config_for_test(&_alpha_rx);
+        beta.flush_config_for_test(&_beta_rx);
 
         let merged = crate::config::load();
         assert_eq!(merged.theme, "quattro-rally");
@@ -8954,12 +9073,14 @@ mod tests {
 
         app.open_ws_menu(0, 0, 0);
         app.ws_menu_action(WsMenuItem::TogglePath);
+        app.flush_config_for_test(&_rx);
         let stored = crate::config::load();
         assert!(!stored.layout.workspace_paths);
         assert!(stored.layout.agent_paths);
 
         app.open_agent_menu(AgentTarget::Live(pane), 0, 0);
         app.agent_menu_action(AgentMenuItem::TogglePath);
+        app.flush_config_for_test(&_rx);
         let stored = crate::config::load();
         assert!(!stored.layout.workspace_paths);
         assert!(!stored.layout.agent_paths);
@@ -9955,6 +10076,7 @@ mod tests {
             "the left sidebar widened by the drag distance"
         );
         // Released width is persisted for the next launch.
+        app.flush_config_for_test(&_rx);
         assert_eq!(
             crate::config::load().sidebars.unwrap().left.width,
             before + 6,
@@ -10426,9 +10548,9 @@ mod tests {
     }
 
     /// End-to-end through the real mouse pipeline (`handle_event`), the user's
-    /// exact report: on a stacked split, clicking the bottom pane's title opens
-    /// its command overlay, clicking its ⤢ zoom toggles zoom, and clicking its
-    /// content focuses it — none of them get eaten by a divider resize.
+    /// exact report: on a stacked split, clicking the bottom pane's title focuses
+    /// it, clicking its ⤢ zoom toggles zoom, and clicking its content focuses it.
+    /// None of them get eaten by a divider resize.
     #[test]
     fn stacked_bottom_pane_title_zoom_and_body_are_all_clickable() {
         let _env = crate::persist::test_env("stacked-clickable");
@@ -10465,19 +10587,17 @@ mod tests {
         app.zoomed = false;
         render(&mut app, &mut term);
 
-        // 2. The title strip opens the running-command overlay.
+        // 2. The title strip focuses its pane without opening an overlay.
         let (_, title) = *app
             .pane_title_rects
             .iter()
             .max_by_key(|(_, rc)| rc.y)
             .expect("bottom pane has a title strip");
+        app.layout_mut().focus = top;
         click(&mut app, title.x + 1, title.y);
-        assert!(
-            app.cmd_inspect.is_some(),
-            "clicking the title opened the command overlay"
-        );
+        assert_eq!(app.layout().focus, bottom, "title click focused its pane");
+        assert!(app.cmd_inspect.is_none(), "title click opened no overlay");
         assert!(app.resize_drag.is_none(), "title did not start a resize");
-        app.close_cmd_inspect();
         render(&mut app, &mut term);
 
         // 3. Focus the top pane, then a click in the bottom pane's *body* focuses
@@ -10882,7 +11002,8 @@ mod tests {
         );
         assert_eq!(
             weights[0] + weights[1],
-            27,            "the pair's combined rows are conserved"
+            27,
+            "the pair's combined rows are conserved"
         );
 
         // Far past the top: the upper dock stops at the floor instead of vanishing.
@@ -11089,7 +11210,8 @@ mod tests {
                 still, moved,
                 "divider {index} must not walk on a second render"
             );
-        }    }
+        }
+    }
 
     /// the invariant the WORKSPACES-vs-FILES bug violated; it now covers every
     /// dock geometry field at once, so a future dock can't reintroduce it.
@@ -11791,10 +11913,24 @@ mod tests {
         let r = call(
             &mut app,
             "task.add",
-            json!({"title":"auth","paths":["src/auth/**"]}),
+            json!({
+                "title":"auth",
+                "prompt":"Review the API.\nInclude rollback coverage.",
+                "paths":["src/auth/**"]
+            }),
         );
         assert_eq!(r["result"]["task"]["id"], "t1");
+        assert_eq!(
+            r["result"]["task"]["prompt"],
+            "Review the API.\nInclude rollback coverage."
+        );
         call(&mut app, "task.add", json!({"title":"api","deps":["t1"]}));
+        let r = call(
+            &mut app,
+            "task.update",
+            json!({"id":"t2", "prompt":"Implement the API client."}),
+        );
+        assert_eq!(r["result"]["task"]["prompt"], "Implement the API client.");
 
         // t2 can't be claimed while its dependency is unfinished.
         let r = call(
@@ -11811,6 +11947,16 @@ mod tests {
             json!({"id":"t1","pane": a.0.to_string()}),
         );
         assert_eq!(r["result"]["task"]["status"], "claimed");
+        let r = call(
+            &mut app,
+            "task.update",
+            json!({"id":"t1", "prompt":"too late"}),
+        );
+        assert_eq!(r["error"]["code"], "task_active");
+        assert_eq!(
+            app.orch.task("t1").unwrap().prompt.as_deref(),
+            Some("Review the API.\nInclude rollback coverage.")
+        );
         let r = call(
             &mut app,
             "lease.acquire",
@@ -12326,6 +12472,7 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         }));
         assert!(app.agents_this_workspace);
+        app.flush_config_for_test(&_rx);
         assert!(crate::config::load().agents_this_workspace);
         app.open_agent_menu(AgentTarget::Session(1), row.x + 1, row.y);
         term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
@@ -12623,6 +12770,7 @@ mod tests {
             crate::i18n::by_code(&app.config.language).workspaces,
             "catalog swapped live"
         );
+        app.flush_config_for_test(&_rx);
         assert_eq!(
             crate::config::load().language,
             app.config.language,
@@ -12749,19 +12897,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    // Clicking a pane's title opens the running-command overlay. The point is
-    // that the command comes from the OS, not the screen: an agent's own UI
-    // elides long commands and those characters never reach luvus at all.
+    // The pane context menu keeps the running-command overlay available. The
+    // command comes from the OS, not the screen, because an agent's own UI can
+    // elide characters before they ever reach luvus.
     #[test]
-    fn clicking_a_pane_title_shows_the_real_command() {
-        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    fn pane_menu_shows_the_real_running_command() {
         use ratatui::{backend::TestBackend, Terminal};
         let _env = crate::persist::test_env("cmd-inspect");
         let (tx, rx) = std::sync::mpsc::channel();
         let mut app = App::new(120, 40, tx).unwrap();
 
-        // Titles (and borders) only render on split panes, so split first — the
-        // single-pane case is covered by the pane context menu instead.
+        // Split first so this continues to exercise the same live child process
+        // setup as the pane-title regression tests.
         app.split(Axis::Col);
         let id = app.layout().focus;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -12777,22 +12924,16 @@ mod tests {
                 Err(error) => panic!("the split pane never became ready: {error}"),
             }
         }
-        // Render once so the title strips are registered as click targets.
+        // The right-click menu action remains the explicit path to inspection.
         let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
         term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
-        let (_, title) = *app
-            .pane_title_rects
-            .iter()
-            .find(|(pid, _)| *pid == id)
-            .expect("the focused pane has a clickable title");
-
         assert!(app.cmd_inspect.is_none());
-        app.handle_event(AppEvent::Mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: title.x + 1,
-            row: title.y,
-            modifiers: KeyModifiers::NONE,
-        }));
+        app.open_pane_menu(id, 1, 1);
+        assert!(
+            app.pane_menu_items().contains(&PaneMenuItem::RunningCmd),
+            "the pane menu offers running-command inspection"
+        );
+        app.pane_menu_action(PaneMenuItem::RunningCmd);
         let c = app.cmd_inspect.as_ref().expect("the overlay opened");
         assert_eq!(c.pane, id);
         // The pane's own shell is the root of the tree, with its real argv.

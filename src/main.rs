@@ -207,6 +207,26 @@ pub(crate) fn emit_clipboard(text: &str) {
     let _ = out.flush();
 }
 
+/// Hand kitty graphics commands to the terminal displaying this client.
+///
+/// The bytes are the child's own commands, forwarded unchanged. They only
+/// teach the terminal an image; nothing is drawn until the frame that follows
+/// paints the placeholder cells referring to it. Writing them straight to the
+/// terminal, rather than through the cell backend, is deliberate: they are not
+/// cells and must not be reflowed, clipped, or styled on the way out.
+///
+/// The server only sends this to clients whose terminals answered the
+/// protocol's support query, so these bytes never reach a terminal that would
+/// print them as text.
+pub(crate) fn emit_graphics(commands: &[Vec<u8>]) {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    for command in commands {
+        let _ = out.write_all(command);
+    }
+    let _ = out.flush();
+}
+
 /// Play a synthesized notification cue. Playback stays client-side so remote
 /// sessions ring where the user is sitting, not on the server host.
 pub(crate) fn emit_sound(signal: sound::SoundSignal) {
@@ -1279,15 +1299,16 @@ fn run(terminal: &mut DefaultTerminal) -> Result<bool> {
     };
     app.events = events.clone();
     app.set_color_mode(ipc::protocol::truecolor_supported());
-    let pending = if app.config.theme == "terminal" {
-        let probe = terminal::theme_probe::probe();
-        if let Some(colors) = probe.colors.as_ref() {
-            app.apply_terminal_colors(colors);
-        }
-        probe.pending
-    } else {
-        Vec::new()
-    };
+    // One process is both client and server here, so it asks its own terminal
+    // the same questions the split path asks over the socket: the palette only
+    // when the Terminal theme reads it, graphics support always.
+    let probe = terminal::theme_probe::probe(app.config.theme == "terminal");
+    if let Some(colors) = probe.colors.as_ref() {
+        app.apply_terminal_colors(colors);
+    }
+    app.set_host_graphics(probe.graphics.unwrap_or(false));
+    app.set_host_cell_size(probe.cell_size);
+    let pending = probe.pending;
     // Match the client path: query colors before enabling input protocols, so
     // any interleaved bytes are ordinary keys that can be replayed losslessly.
     let _ = execute!(
@@ -1343,13 +1364,9 @@ fn run(terminal: &mut DefaultTerminal) -> Result<bool> {
         // retain both flags and retry at the normal cadence instead of hot-looping.
         let immediate_save_due = app.persist_session_now && !immediate_save_attempted;
         let debounced_save_due = app.session_dirty && last_save.elapsed() > Duration::from_secs(2);
-        if immediate_save_due || debounced_save_due {
+        if !app.session_save_inflight && (immediate_save_due || debounced_save_due) {
             immediate_save_attempted = app.persist_session_now;
-            if persist::save(&app) {
-                app.persist_session_now = false;
-                app.session_dirty = false;
-                immediate_save_attempted = false;
-            }
+            app.schedule_session_save();
             last_save = Instant::now();
         }
 
@@ -1390,7 +1407,7 @@ fn run(terminal: &mut DefaultTerminal) -> Result<bool> {
     }
 
     let detached = app.detach_requested;
-    persist::save(&app);
+    app.finish_session_persistence();
     Ok(detached)
 }
 

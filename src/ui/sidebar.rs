@@ -143,7 +143,8 @@ fn dock_slots(body: Rect, weights: &[u16]) -> (Vec<Rect>, Vec<u16>) {
         // the clamp well-formed while the layout degrades evenly.
         let reserved = docks_left.saturating_sub(1) * (crate::app::MIN_DOCK_HEIGHT + 1);
         let ceiling = remaining.saturating_sub(reserved);
-        let h = share.clamp(crate::app::MIN_DOCK_HEIGHT.min(ceiling), ceiling);        slots.push(Rect::new(body.x, y, body.width, h));
+        let h = share.clamp(crate::app::MIN_DOCK_HEIGHT.min(ceiling), ceiling);
+        slots.push(Rect::new(body.x, y, body.width, h));
         y += h;
         if i + 1 < n {
             dividers.push(y);
@@ -1430,6 +1431,7 @@ mod tests {
         }));
         assert!(app.agents_active_only);
         assert_eq!(app.agents_scroll, 0);
+        app.flush_config_for_test(&_rx);
         assert!(crate::config::load().agents_active_only);
         term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
         assert!(
@@ -1462,6 +1464,7 @@ mod tests {
         }));
         assert!(!app.agents_active_only);
         assert_eq!(app.agents_scroll, 0);
+        app.flush_config_for_test(&_rx);
         assert!(!crate::config::load().agents_active_only);
         term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
         assert!(buffer_contains(&term, "resume"));
@@ -1560,6 +1563,7 @@ mod tests {
         assert!(app.agents_this_workspace);
         assert!(!app.agents_active_only, "scope is independent of lifecycle");
         assert_eq!(app.agents_scroll, 0);
+        app.flush_config_for_test(&_rx);
         assert!(crate::config::load().agents_this_workspace);
 
         term.draw(|f| crate::ui::render(f, &mut app)).unwrap();

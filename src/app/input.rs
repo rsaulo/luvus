@@ -337,7 +337,7 @@ impl App {
             return true;
         };
         let response = self.handle_api(&req);
-        let _ = req.reply.send(response);
+        self.reply_after_automation_save(req, response);
         true
     }
 
@@ -420,6 +420,9 @@ impl App {
         // off-loop. Apply its completed registry before the empty-workspace guard
         // so the single writer always observes the result.
         let ev = match ev {
+            AppEvent::IoCompleted(completion) => {
+                return completion.apply(self);
+            }
             AppEvent::BackendCreateReady {
                 id,
                 reply,
@@ -464,7 +467,12 @@ impl App {
                 return true;
             }
             AppEvent::ConfigReloaded { id, config, reply } => {
-                let response = match self.apply_socket_config(*config, None) {                    Ok(()) => {
+                if self.config_save_pending() {
+                    self.defer_config_reload(id, reply);
+                    return false;
+                }
+                let response = match self.apply_socket_config(*config, None) {
+                    Ok(()) => {
                         json!({"id":id,"result":{"type":"config_reloaded","config":self.config}})
                     }
                     Err((code, message)) => {
@@ -583,7 +591,7 @@ impl App {
                         return true;
                     }
                     let resp = self.handle_api(&req);
-                    let _ = req.reply.send(resp);
+                    self.reply_after_automation_save(req, resp);
                     return true;
                 }
                 AppEvent::WaitOutput { id, reply, .. } => {
@@ -672,6 +680,20 @@ impl App {
                 self.force_redraw = true;
                 true
             }
+            AppEvent::PtyInputRejected(id) => {
+                crate::logging::event(
+                    crate::logging::EventKind::PtyInputRejected,
+                    &[crate::logging::Field::PaneId(u64::from(id.0))],
+                );
+                if let Some(pane) = self.panes.get(&id) {
+                    pane.acknowledge_input_rejection();
+                    self.show_toast(format!(
+                        "pane {} input queue full: input rejected; wait for the child to read",
+                        id.0
+                    ));
+                }
+                true
+            }
             AppEvent::PtyData(id) => {
                 // The reader's coalescing flag is deliberately NOT cleared here
                 // — it re-arms on the frame/detect cadence (`rearm_pty_notify`),
@@ -681,7 +703,9 @@ impl App {
                     s.last_activity = Instant::now();
                 }
                 self.detection_dirty.insert(id);
-                self.runtime_cwd_dirty = true;
+                if self.panes.contains_key(&id) {
+                    self.runtime_cwd_dirty_panes.insert(id);
+                }
                 self.runtime_proc_dirty = true;
                 // A parked `wait.output` for this pane just got new output to
                 // test against — resolve it on the same wake (docs/81).
@@ -690,6 +714,7 @@ impl App {
                 true // the pane's screen advanced
             }
             AppEvent::PtyExit(id) => {
+                self.runtime_cwd_dirty_panes.remove(&id);
                 crate::logging::event(
                     crate::logging::EventKind::PtyExit,
                     &[
@@ -1042,10 +1067,12 @@ impl App {
             // Handled by the server loop; never reaches here at runtime.
             AppEvent::ClientConnected { .. }
             | AppEvent::ClientDetach { .. }
+            | AppEvent::ClientGraphicsSent { .. }
             | AppEvent::ClientInput { .. }
             | AppEvent::Shutdown => false,
             // Consumed by the pre-dispatch worker-result branch above.
-            AppEvent::ThemeUninstalled { .. }
+            AppEvent::IoCompleted(_)
+            | AppEvent::ThemeUninstalled { .. }
             | AppEvent::ConfigReloaded { .. }
             | AppEvent::ManifestsReloaded { .. }
             | AppEvent::BackendCreateReady { .. }
@@ -1091,8 +1118,8 @@ impl App {
     /// Route pasted text into an open text-input modal by replaying it as
     /// keypresses, so a paste fills the field instead of leaking to the pane
     /// underneath. Mirrors `handle_key`'s text-input precedence; returns whether
-    /// a modal consumed it. Control chars (newlines/tabs) are dropped — these are
-    /// all single-line fields.
+    /// a modal consumed it. Control characters are dropped from single-line
+    /// fields; the ORCH prompt preserves normalized line feeds.
     fn paste_into_modal(&mut self, s: &str) -> bool {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         if self.named_session_menu.is_some() {
@@ -1118,6 +1145,25 @@ impl App {
             self.picker_paste(s);
             return true;
         }
+        if self.orch_form.is_some() {
+            let multiline = self
+                .orch_form
+                .as_ref()
+                .is_some_and(|form| form.field == crate::app::OrchFormField::Prompt);
+            for character in s.replace("\r\n", "\n").replace('\r', "\n").chars() {
+                if character == '\n' && multiline {
+                    if let Some(form) = self.orch_form.as_mut() {
+                        form.push_char('\n');
+                    }
+                } else if !character.is_control() {
+                    self.handle_orch_form_key(KeyEvent::new(
+                        KeyCode::Char(character),
+                        KeyModifiers::NONE,
+                    ));
+                }
+            }
+            return true;
+        }
         let handler: fn(&mut Self, KeyEvent) = if self.worktree_prompt.is_some() {
             Self::handle_worktree_prompt_key
         } else if self.tab_rename.is_some() {
@@ -1128,8 +1174,6 @@ impl App {
             Self::handle_ws_rename_key
         } else if self.pane_rename.is_some() {
             Self::handle_pane_rename_key
-        } else if self.orch_form.is_some() {
-            Self::handle_orch_form_key
         } else {
             return false;
         };
@@ -2483,18 +2527,6 @@ impl App {
         // a split can be expanded to fullscreen on a phone (docs/18).
         if self.pane_zoom_rect.is_some_and(hit) {
             self.zoomed = !self.zoomed;
-            return;
-        }
-        // Clicking a pane's title strip opens the running-command overlay — the
-        // full argv from the OS, since an agent's on-screen `Bash(… …)` is
-        // elided before it ever reaches us.
-        if let Some((id, _)) = self
-            .pane_title_rects
-            .iter()
-            .find(|(_, rect)| hit(*rect))
-            .map(|(id, r)| (*id, *r))
-        {
-            self.open_cmd_inspect(id);
             return;
         }
         // Tab-bar scroll arrows: step to the previous / next tab.
@@ -4302,6 +4334,24 @@ fn csi_tilde_key(code: u8, modifiers: KeyModifiers) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_prompt_paste_preserves_normalized_newlines() {
+        let _env = crate::persist::test_env("orch-prompt-paste");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(80, 24, tx).unwrap();
+        app.orch_form = Some(crate::app::OrchForm {
+            kind: crate::app::OrchFormKind::Task,
+            field: crate::app::OrchFormField::Prompt,
+            ..crate::app::OrchForm::default()
+        });
+
+        assert!(app.paste_into_modal("first\r\nsecond\rthird\tline"));
+        assert_eq!(
+            app.orch_form.as_ref().unwrap().prompt,
+            "first\nsecond\nthirdline"
+        );
+    }
 
     #[test]
     fn prefix_digits_jump_to_tabs_and_shifted_digits_jump_to_workspaces() {
@@ -6506,10 +6556,14 @@ mod link_click_tests {
             KeyModifiers::NONE,
         ));
         assert!(
-            app.cmd_inspect.is_some(),
-            "the title click opened the command overlay (setup sanity)"
+            app.cmd_inspect.is_none(),
+            "the title click did not open the command overlay"
         );
-        app.close_cmd_inspect();
+        assert_eq!(
+            app.layout().focus,
+            bottom,
+            "the title click focused the pane"
+        );
         // Reset focus *after* the title click, so only the body click can move it.
         app.layout_mut().focus = top;
         app.handle_event(mouse(

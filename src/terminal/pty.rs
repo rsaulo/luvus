@@ -9,9 +9,9 @@ use std::io::Read;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Sender};
-#[cfg(unix)]
-use std::sync::OnceLock;
+#[cfg(all(test, unix))]
+use std::sync::mpsc;
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -24,8 +24,14 @@ use crate::terminal::appearance::PaneAppearance;
 use crate::terminal::backend::TerminalRuntime;
 use crate::terminal::vt::{create_engine, VtEngine, VtEngineKind};
 
+pub(crate) mod input;
 mod io;
 mod reaper;
+pub(crate) use input::InputSender;
+
+/// Keep each pane's read working set small. Unix amortizes synchronization by
+/// draining several of these chunks under one bounded engine lock.
+const PTY_READ_BUFFER_BYTES: usize = 8 * 1024;
 
 #[cfg(test)]
 use reaper::child_poll_finished;
@@ -46,51 +52,6 @@ pub(crate) enum InputAction {
         paste: Vec<u8>,
         settle: std::time::Duration,
     },
-}
-
-/// Ordered PTY input plus an optional Unix actor wakeup. Terminal-generated
-/// replies and user input share this sender, preserving their FIFO order.
-#[derive(Clone)]
-pub(crate) struct InputSender {
-    sender: Sender<InputAction>,
-    #[cfg(unix)]
-    wake: Arc<OnceLock<Arc<io::unix_actor::WakePipe>>>,
-}
-
-impl InputSender {
-    #[cfg(unix)]
-    fn with_wake_slot(
-        sender: Sender<InputAction>,
-        wake: Arc<OnceLock<Arc<io::unix_actor::WakePipe>>>,
-    ) -> Self {
-        Self { sender, wake }
-    }
-
-    pub(crate) fn send(
-        &self,
-        action: InputAction,
-    ) -> std::result::Result<(), mpsc::SendError<InputAction>> {
-        self.sender.send(action)?;
-        self.wake();
-        Ok(())
-    }
-
-    fn wake(&self) {
-        #[cfg(unix)]
-        if let Some(wake) = self.wake.get() {
-            wake.wake();
-        }
-    }
-}
-
-impl From<Sender<InputAction>> for InputSender {
-    fn from(sender: Sender<InputAction>) -> Self {
-        Self {
-            sender,
-            #[cfg(unix)]
-            wake: Arc::new(OnceLock::new()),
-        }
-    }
 }
 
 #[cfg(any(windows, test))]
@@ -145,6 +106,9 @@ pub struct Pane {
     /// it while holding the VT lock, so capture can return a revision that
     /// exactly matches the screen snapshot it serialized.
     content_revision: Arc<AtomicU64>,
+    observed_title_generation: AtomicU64,
+    #[cfg(windows)]
+    history_maintenance_pending: AtomicBool,
     /// `PtyData` coalescing: set by the reader when it announces new output,
     /// cleared by the app loop when it consumes the event. While set, further
     /// reads skip the send — a saturated PTY (thousands of 8 KB reads/s) wakes
@@ -160,6 +124,9 @@ pub struct Pane {
     size: Arc<Mutex<(u16, u16)>>,
     /// Set by `Drop` so a close-before-spawn aborts the spawn worker.
     cancelled: Arc<AtomicBool>,
+    /// Read whenever this pane's window size is set, so the pixel dimensions a
+    /// child sees follow the terminal the user is actually looking at.
+    host_graphics: crate::terminal::graphics::HostGraphics,
 }
 
 impl Drop for Pane {
@@ -224,6 +191,7 @@ impl Pane {
         shell: &str,
         history_budget_bytes: usize,
         appearance: PaneAppearance,
+        host_graphics: crate::terminal::graphics::HostGraphics,
     ) -> Result<Pane> {
         let cmd = CommandBuilder::new(shell);
         Self::build(
@@ -238,6 +206,7 @@ impl Pane {
             &[],
             history_budget_bytes,
             appearance,
+            host_graphics,
         )
     }
 
@@ -257,6 +226,7 @@ impl Pane {
         argv: &[String],
         history_budget_bytes: usize,
         appearance: PaneAppearance,
+        host_graphics: crate::terminal::graphics::HostGraphics,
     ) -> Result<Pane> {
         let Some((program, args)) = argv.split_first() else {
             return Err(anyhow::anyhow!("empty shell command"));
@@ -277,6 +247,7 @@ impl Pane {
             &[],
             history_budget_bytes,
             appearance,
+            host_graphics,
         )
     }
 
@@ -293,6 +264,7 @@ impl Pane {
         env: &[(String, String)],
         history_budget_bytes: usize,
         appearance: PaneAppearance,
+        host_graphics: crate::terminal::graphics::HostGraphics,
     ) -> Result<Pane> {
         let Some((program, args)) = argv.split_first() else {
             return Err(anyhow::anyhow!("empty module command"));
@@ -313,6 +285,7 @@ impl Pane {
             env,
             history_budget_bytes,
             appearance,
+            host_graphics,
         )
     }
 
@@ -332,6 +305,7 @@ impl Pane {
         shell: &str,
         history_budget_bytes: usize,
         appearance: PaneAppearance,
+        host_graphics: crate::terminal::graphics::HostGraphics,
     ) -> Pane {
         let cmd = CommandBuilder::new(shell);
         Self::build_deferred(
@@ -347,6 +321,7 @@ impl Pane {
             &[],
             history_budget_bytes,
             appearance,
+            host_graphics,
         )
     }
 
@@ -366,6 +341,7 @@ impl Pane {
         shell: &str,
         history_budget_bytes: usize,
         appearance: PaneAppearance,
+        host_graphics: crate::terminal::graphics::HostGraphics,
     ) -> Pane {
         let cmd = CommandBuilder::new(shell);
         Self::build_deferred(
@@ -381,6 +357,7 @@ impl Pane {
             &[],
             history_budget_bytes,
             appearance,
+            host_graphics,
         )
     }
 
@@ -399,6 +376,7 @@ impl Pane {
         argv: &[String],
         history_budget_bytes: usize,
         appearance: PaneAppearance,
+        host_graphics: crate::terminal::graphics::HostGraphics,
     ) -> Result<Pane> {
         let Some((program, args)) = argv.split_first() else {
             return Err(anyhow::anyhow!("empty shell command"));
@@ -420,6 +398,7 @@ impl Pane {
             &[],
             history_budget_bytes,
             appearance,
+            host_graphics,
         ))
     }
 
@@ -436,14 +415,11 @@ impl Pane {
         extra_env: &[(String, String)],
         history_budget_bytes: usize,
         appearance: PaneAppearance,
+        host_graphics: crate::terminal::graphics::HostGraphics,
     ) -> Result<Pane> {
         let pty_system = native_pty_system();
-        let pair = pty_system.openpty(PtySize {
-            rows: rows.max(1),
-            cols: cols.max(1),
-            pixel_width: 0,
-            pixel_height: 0,
-        })?;
+        let pane_host_graphics = host_graphics.clone();
+        let pair = pty_system.openpty(pty_size(cols, rows, &host_graphics))?;
 
         apply_pane_env(&mut cmd, id, &cwd, extra_env);
         let mut child = pair.slave.spawn_command(cmd)?;
@@ -462,6 +438,7 @@ impl Pane {
         // User input and terminal-generated responses share one ordered queue.
         // Unix wakes one poll-driven actor; Windows retains the split backend.
         let (input_tx, input_rx) = io::input_channel();
+        input_tx.set_notice(id, app_tx.clone());
         let engine = create_engine(
             VtEngineKind::default(),
             cols,
@@ -469,6 +446,7 @@ impl Pane {
             input_tx.clone(),
             history_budget_bytes,
             appearance,
+            host_graphics,
         );
         // Replay the saved screen so a restored pane shows its prior content.
         if let Some(screen) = initial {
@@ -503,10 +481,14 @@ impl Pane {
 
         Ok(Pane {
             id,
+            host_graphics: pane_host_graphics,
             engine,
             child_pid: Arc::new(AtomicU32::new(child_pid)),
             terminal_runtime: Arc::new(Mutex::new(Some(terminal_runtime))),
             content_revision,
+            observed_title_generation: AtomicU64::new(0),
+            #[cfg(windows)]
+            history_maintenance_pending: AtomicBool::new(true),
             master: Arc::new(Mutex::new(Some(pair.master))),
             input_tx,
             cwd,
@@ -536,10 +518,12 @@ impl Pane {
         extra_env: &[(String, String)],
         history_budget_bytes: usize,
         appearance: PaneAppearance,
+        host_graphics: crate::terminal::graphics::HostGraphics,
     ) -> Pane {
         // Everything a caller can observe before the child exists: the engine
         // (pane.read, detection, rendering) and the input queue.
         let (input_tx, input_rx) = io::input_channel();
+        input_tx.set_notice(id, app_tx.clone());
         let engine = create_engine(
             VtEngineKind::default(),
             cols,
@@ -547,7 +531,9 @@ impl Pane {
             input_tx.clone(),
             history_budget_bytes,
             appearance,
+            host_graphics.clone(),
         );
+        let pane_host_graphics = host_graphics.clone();
         if let Some(screen) = initial {
             if let Ok(mut engine) = engine.lock() {
                 engine.advance(screen.as_bytes());
@@ -590,6 +576,7 @@ impl Pane {
             let worker_cwd = cwd.clone();
             let worker_fallback_cwds = fallback_cwds.to_vec();
             let worker_env = extra_env.to_vec();
+            let worker_host_graphics = host_graphics.clone();
             thread::spawn(move || {
                 let fail = || {
                     let _ = tx.send(AppEvent::PtyExit(id));
@@ -597,12 +584,7 @@ impl Pane {
 
                 let (cols, rows) = *size.lock().unwrap_or_else(|p| p.into_inner());
                 let pty_system = native_pty_system();
-                let pair = match pty_system.openpty(PtySize {
-                    rows: rows.max(1),
-                    cols: cols.max(1),
-                    pixel_width: 0,
-                    pixel_height: 0,
-                }) {
+                let pair = match pty_system.openpty(pty_size(cols, rows, &worker_host_graphics)) {
                     Ok(pair) => pair,
                     Err(_) => return fail(),
                 };
@@ -669,12 +651,9 @@ impl Pane {
                 // A resize raced the spawn: re-apply the latest size.
                 let latest = *size.lock().unwrap_or_else(|p| p.into_inner());
                 if latest != (cols, rows) {
-                    let _ = pair.master.resize(PtySize {
-                        rows: latest.1.max(1),
-                        cols: latest.0.max(1),
-                        pixel_width: 0,
-                        pixel_height: 0,
-                    });
+                    let _ = pair
+                        .master
+                        .resize(pty_size(latest.0, latest.1, &worker_host_graphics));
                 }
 
                 if io::start(
@@ -709,10 +688,14 @@ impl Pane {
 
         Pane {
             id,
+            host_graphics: pane_host_graphics,
             engine,
             child_pid,
             terminal_runtime,
             content_revision,
+            observed_title_generation: AtomicU64::new(0),
+            #[cfg(windows)]
+            history_maintenance_pending: AtomicBool::new(true),
             master,
             input_tx,
             cwd,
@@ -731,9 +714,18 @@ impl Pane {
         let pending = self
             .data_pending
             .swap(false, std::sync::atomic::Ordering::AcqRel);
-        if pending {
+        // Unix compacts on a bounded deadline in its existing descriptor
+        // actor. Doing it here would repeatedly pack and re-inflate rows while
+        // one large output stream is still being consumed. The blocking
+        // Windows reader has no such event-loop deadline, so retain its
+        // coalesced app-boundary maintenance.
+        #[cfg(windows)]
+        if pending || self.history_maintenance_pending.load(Ordering::Acquire) {
             if let Ok(mut engine) = self.engine.lock() {
-                engine.finish_output_batch();
+                let more =
+                    engine.finish_output_batch_step() || engine.history_maintenance_pending();
+                self.history_maintenance_pending
+                    .store(more, Ordering::Release);
             }
         }
         pending
@@ -743,7 +735,38 @@ impl Pane {
     /// consuming it. The server uses this to arm the 100 ms fallback only while
     /// a pane actually has pending bytes, instead of waking forever when idle.
     pub fn has_data_pending(&self) -> bool {
+        #[cfg(windows)]
+        if self.history_maintenance_pending.load(Ordering::Acquire) {
+            return true;
+        }
         self.data_pending.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn has_history_maintenance(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.history_maintenance_pending.load(Ordering::Acquire)
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
+    /// Coalesce title-only presentation with the existing PTY output wake.
+    pub(crate) fn take_title_change(&self) -> bool {
+        let Ok(engine) = self.engine.lock() else {
+            return false;
+        };
+        let generation = engine.title_generation();
+        self.observed_title_generation
+            .swap(generation, Ordering::AcqRel)
+            != generation
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_data_pending_for_test(&self) {
+        self.data_pending.store(true, Ordering::Release);
     }
 
     /// Clear the pending-output coalescing flag so the reader's next
@@ -766,7 +789,11 @@ impl Pane {
         self.rearm_pty_notify();
         self.input_tx
             .send(InputAction::Bytes(bytes.to_vec()))
-            .map_err(|_| "target pane closed before input was delivered".to_string())
+            .map_err(str::to_string)
+    }
+
+    pub(crate) fn acknowledge_input_rejection(&self) {
+        self.input_tx.acknowledge_rejection();
     }
 
     #[cfg(test)]
@@ -778,6 +805,15 @@ impl Pane {
     /// success is dispatch evidence only; it does not claim the child consumed
     /// or acted on the bytes.
     pub fn try_submit_text(&self, text: &str) -> Result<(), String> {
+        self.try_submit_text_with_settle(text, std::time::Duration::from_millis(30))
+    }
+
+    /// Admit paste and Enter together, preserving the caller's settle policy.
+    pub(crate) fn try_submit_text_with_settle(
+        &self,
+        text: &str,
+        settle: std::time::Duration,
+    ) -> Result<(), String> {
         let bracketed = self
             .engine
             .lock()
@@ -791,9 +827,9 @@ impl Pane {
                 } else {
                     wrap_paste(text, bracketed)
                 },
-                settle: std::time::Duration::from_millis(30),
+                settle,
             })
-            .map_err(|_| "target pane closed before input was queued".to_string())
+            .map_err(str::to_string)
     }
 
     pub fn terminal_runtime(&self) -> Option<TerminalRuntime> {
@@ -815,25 +851,19 @@ impl Pane {
         self.child_exited.load(Ordering::SeqCst)
     }
 
-    /// Enqueue `bytes` after `delay`, off-thread. Used to follow a pasted prompt
-    /// with a submit key once the child has ingested the paste: an agent's input
-    /// widget needs the paste to land before the Enter, or the Enter is swallowed
-    /// into the paste. The cloned input channel keeps the writer alive for exactly
-    /// this one deferred send.
-    pub fn send_after(&self, bytes: Vec<u8>, delay: std::time::Duration) {
-        let tx = self.input_tx.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(delay);
-            let _ = tx.send(InputAction::Bytes(bytes));
-        });
+    fn wake_history_maintenance(&self) {
+        self.input_tx.wake();
+        #[cfg(windows)]
+        self.history_maintenance_pending
+            .store(true, Ordering::Release);
     }
 
-    /// Apply a new per-pane history memory budget (Settings → Layout). Shrinks
-    /// retained history immediately when lowered.
+    /// Apply a new per-pane history memory budget, shrinking retention immediately.
     pub fn set_history_budget(&self, bytes: usize) {
         if let Ok(mut e) = self.engine.lock() {
             e.set_history_budget(bytes);
         }
+        self.wake_history_maintenance();
     }
 
     /// Scroll this pane's scrollback viewport `delta` lines (positive = up into
@@ -962,6 +992,12 @@ impl Pane {
                 cache_bytes: None,
                 compacted_rows: None,
                 allocated_cells: None,
+                packed_blocks: None,
+                packed_bytes: None,
+                packed_rows: None,
+                dense_row_bytes: None,
+                row_descriptor_bytes: None,
+                allocation_count: None,
                 exact_bytes: false,
             },
         )
@@ -1029,12 +1065,7 @@ impl Pane {
     /// dropped file's path as literal text instead of attaching the file, and
     /// vim auto-indents pasted code. Re-wrapping restores the distinction.
     pub fn send_paste(&self, text: &str) {
-        let bracketed = self
-            .engine
-            .lock()
-            .map(|e| e.bracketed_paste())
-            .unwrap_or(false);
-        self.send(&wrap_paste(text, bracketed));
+        let _ = self.try_send_paste(text);
     }
 
     pub fn try_send_paste(&self, text: &str) -> Result<(), String> {
@@ -1050,6 +1081,21 @@ impl Pane {
     /// caller can note the resize for detection's post-resize grace, docs/07).
     /// A deferred pane that has not spawned yet records the size; the spawn
     /// worker applies it (docs/82).
+    /// Re-send the window size without changing the cell grid.
+    ///
+    /// The pixel dimensions in it come from the terminal displaying a client,
+    /// so they change when clients attach or detach even though the pane is
+    /// the same size. A child that draws images reads those fields, and only
+    /// learns the new ones when the size is sent again.
+    pub fn refresh_window_size(&self) {
+        let (cols, rows) = *self.size.lock().unwrap_or_else(|p| p.into_inner());
+        if let Ok(master) = self.master.lock() {
+            if let Some(master) = master.as_ref() {
+                let _ = master.resize(pty_size(cols, rows, &self.host_graphics));
+            }
+        }
+    }
+
     pub fn resize(&mut self, cols: u16, rows: u16) -> bool {
         if cols == 0 || rows == 0 {
             return false;
@@ -1063,17 +1109,13 @@ impl Pane {
         }
         if let Ok(master) = self.master.lock() {
             if let Some(master) = master.as_ref() {
-                let _ = master.resize(PtySize {
-                    rows,
-                    cols,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                });
+                let _ = master.resize(pty_size(cols, rows, &self.host_graphics));
             }
         }
         if let Ok(mut e) = self.engine.lock() {
             e.resize(cols, rows);
         }
+        self.wake_history_maintenance();
         crate::logging::event(
             crate::logging::EventKind::PtyResize,
             &[
@@ -1102,6 +1144,24 @@ fn wrap_paste(text: &str, bracketed: bool) -> Vec<u8> {
     out.extend_from_slice(text.as_bytes());
     out.extend_from_slice(b"\x1b[201~");
     out
+}
+
+/// The window size a pane reports to its child.
+///
+/// A terminal reports its text area in pixels as well as in cells, and a
+/// program that draws an image reads the pixel fields to choose a resolution.
+/// Luvus is not a display, so it can only answer once a client has told it how
+/// big a cell is on the terminal in front of the user; until then the pixel
+/// fields stay zero, which is the conventional way to say "unknown".
+fn pty_size(cols: u16, rows: u16, host: &crate::terminal::graphics::HostGraphics) -> PtySize {
+    let (cols, rows) = (cols.max(1), rows.max(1));
+    let cell = host.cell_size();
+    PtySize {
+        rows,
+        cols,
+        pixel_width: cell.map_or(0, |cell| cols.saturating_mul(cell.width)),
+        pixel_height: cell.map_or(0, |cell| rows.saturating_mul(cell.height)),
+    }
 }
 
 /// The file-name component of a program path, for the pane's display command.
@@ -1176,7 +1236,7 @@ fn read_loop(
     data_pending: Arc<AtomicBool>,
     content_revision: Arc<AtomicU64>,
 ) {
-    let mut buf = [0u8; 8192];
+    let mut buf = [0u8; PTY_READ_BUFFER_BYTES];
     loop {
         match reader.read(&mut buf) {
             Ok(0) | Err(_) => {
@@ -1262,6 +1322,7 @@ mod reap_tests {
             "/bin/sh",
             500,
             PaneAppearance::default(),
+            crate::terminal::graphics::HostGraphics::default(),
         )
         .expect("spawn")
     }
@@ -1319,6 +1380,7 @@ mod reap_tests {
             "/bin/sh",
             500,
             PaneAppearance::default(),
+            crate::terminal::graphics::HostGraphics::default(),
         )
         .expect("spawn shell with inherited blocked SIGCHLD");
         let pid = pane.child_pid.load(Ordering::SeqCst);
@@ -1360,6 +1422,41 @@ mod reap_tests {
         assert!(wait_gone(pid), "exit is still reaped without a timer");
     }
 
+    #[test]
+    fn quiet_pty_history_and_resize_finish_incremental_maintenance() {
+        let _env = crate::persist::test_env("pty-history-maintenance");
+        let (tx, rx) = mpsc::channel();
+        let mut pane = Pane::spawn_command(
+            PaneId::alloc(), 80, 24, std::env::current_dir().unwrap(), tx,
+            &["/bin/sh".into(), "-c".into(), "i=0; while [ $i -lt 2024 ]; do printf 'row %s cafe\n' \"$i\"; i=$((i + 1)); done; sleep 10".into()],
+            &[], 16 * 1024 * 1024, PaneAppearance::default(),
+            crate::terminal::graphics::HostGraphics::default(),
+        ).unwrap();
+        for resize in [false, true] {
+            if resize {
+                assert!(pane.resize(90, 24));
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let complete = {
+                    let engine = pane.engine.lock().unwrap();
+                    let metrics = engine.history_metrics();
+                    metrics.retained_rows >= 1900
+                        && metrics.packed_rows.unwrap_or(0) > 1700
+                        && !engine.history_maintenance_pending()
+                };
+                if complete {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "quiet packing must finish without another output event"
+                );
+                let _ = rx.recv_timeout(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+
     /// A deferred pane (docs/82) is fully usable before its shell exists:
     /// input queued right after creation reaches the child once the worker
     /// forks, and the pid stays 0 until then.
@@ -1378,6 +1475,7 @@ mod reap_tests {
             "/bin/sh",
             500,
             PaneAppearance::default(),
+            crate::terminal::graphics::HostGraphics::default(),
         );
         assert_eq!(
             pane.child_pid.load(Ordering::SeqCst),
@@ -1424,6 +1522,7 @@ mod reap_tests {
             "/bin/sh",
             500,
             PaneAppearance::default(),
+            crate::terminal::graphics::HostGraphics::default(),
         );
         assert!(
             pane.engine
@@ -1452,6 +1551,7 @@ mod reap_tests {
             "/bin/sh",
             500,
             PaneAppearance::default(),
+            crate::terminal::graphics::HostGraphics::default(),
         );
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -1494,6 +1594,7 @@ mod reap_tests {
             "/bin/sh",
             500,
             PaneAppearance::default(),
+            crate::terminal::graphics::HostGraphics::default(),
         );
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -1530,6 +1631,7 @@ mod reap_tests {
             "/bin/sh",
             500,
             PaneAppearance::default(),
+            crate::terminal::graphics::HostGraphics::default(),
         );
         // The spawn has not forked yet: this is the racing resize.
         assert!(pane.resize(132, 40));
@@ -1592,10 +1694,57 @@ mod reap_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        child_poll_finished, path_with_server_binary, wrap_paste, write_input_action, InputAction,
+        child_poll_finished, path_with_server_binary, pty_size, wrap_paste, write_input_action,
+        InputAction,
     };
+    use crate::terminal::graphics::HostGraphics;
+    use crate::terminal::theme_probe::CellSize;
     use std::path::PathBuf;
     use std::time::Duration;
+
+    /// A pane reports its size in pixels as well as in cells, and a program
+    /// that draws an image reads the pixel fields to pick a resolution. Luvus
+    /// is not a display, so it can only fill them in once a client has said how
+    /// big a cell is on the terminal in front of the user.
+    #[test]
+    fn a_pane_reports_pixels_only_once_a_client_has_measured_a_cell() {
+        let host = HostGraphics::default();
+
+        let unknown = pty_size(80, 24, &host);
+        assert_eq!((unknown.cols, unknown.rows), (80, 24));
+        assert_eq!(
+            (unknown.pixel_width, unknown.pixel_height),
+            (0, 0),
+            "zero is how a terminal says it does not know, and luvus does not"
+        );
+
+        host.set_cell_size(Some(CellSize {
+            width: 14,
+            height: 34,
+        }));
+        let known = pty_size(80, 24, &host);
+        assert_eq!((known.cols, known.rows), (80, 24));
+        assert_eq!((known.pixel_width, known.pixel_height), (80 * 14, 24 * 34));
+
+        // The last drawing client detaching takes the measurement with it.
+        host.set_cell_size(None);
+        let forgotten = pty_size(80, 24, &host);
+        assert_eq!((forgotten.pixel_width, forgotten.pixel_height), (0, 0));
+    }
+
+    #[test]
+    fn a_degenerate_pane_still_reports_a_usable_size() {
+        let host = HostGraphics::default();
+        host.set_cell_size(Some(CellSize {
+            width: 14,
+            height: 34,
+        }));
+        // A zero-column pane would otherwise divide into a zero-pixel area,
+        // which a program reads as "unknown" rather than "empty".
+        let size = pty_size(0, 0, &host);
+        assert_eq!((size.cols, size.rows), (1, 1));
+        assert_eq!((size.pixel_width, size.pixel_height), (14, 34));
+    }
 
     #[test]
     fn submit_action_writes_one_paste_then_exactly_one_enter() {

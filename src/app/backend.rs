@@ -307,7 +307,7 @@ impl App {
         let text = required_bounded_string(params, "text", backend::MAX_INPUT_BYTES, true)?;
         self.panes[&pane_id]
             .try_send(text.as_bytes())
-            .map_err(|_| mutation_error("send_failed", "terminal input queue is closed"))?;
+            .map_err(|message| mutation_error("send_failed", message))?;
         Ok(queued_action_json())
     }
 
@@ -326,7 +326,7 @@ impl App {
         let text = required_bounded_string(params, "text", backend::MAX_INPUT_BYTES, true)?;
         self.panes[&pane_id]
             .try_submit_text(text)
-            .map_err(|_| mutation_error("send_failed", "terminal input queue is closed"))?;
+            .map_err(|message| mutation_error("send_failed", message))?;
         Ok(queued_action_json())
     }
 
@@ -352,7 +352,7 @@ impl App {
             )
         })?;
         pane.try_send(&bytes)
-            .map_err(|_| mutation_error("send_failed", "terminal input queue is closed"))?;
+            .map_err(|message| mutation_error("send_failed", message))?;
         Ok(queued_action_json())
     }
 
@@ -700,6 +700,7 @@ impl App {
         let shell = crate::platform::resolve_shell(&self.config.shell);
         let history_budget = self.config.scrollback_bytes();
         let appearance = self.pane_appearance;
+        let host_graphics = self.host_graphics.clone();
         let app_tx = self.app_tx.clone();
         let event_tx = self.app_tx.clone();
         std::thread::spawn(move || {
@@ -727,6 +728,7 @@ impl App {
                             &[],
                             history_budget,
                             appearance,
+                            host_graphics.clone(),
                         ),
                         None => crate::terminal::pty::Pane::spawn(
                             pane_id,
@@ -738,6 +740,7 @@ impl App {
                             &shell,
                             history_budget,
                             appearance,
+                            host_graphics.clone(),
                         ),
                     }
                     .map_err(|_| "PTY or root process failed to start".to_string());
@@ -1307,7 +1310,7 @@ fn reject_mutation_fields(params: &Value, allowed: &[&str]) -> Result<(), Backen
     })
 }
 
-fn mutation_error(code: &'static str, message: &'static str) -> BackendError {
+fn mutation_error(code: &'static str, message: impl Into<String>) -> BackendError {
     BackendError::mutation(code, message, DispatchEvidence::Rejected)
 }
 
@@ -1672,6 +1675,7 @@ mod tests {
             &valid_shell,
             app.config.scrollback_bytes(),
             app.pane_appearance,
+            app.host_graphics.clone(),
         )
         .unwrap();
         app.panes.insert(deferred, ready);
