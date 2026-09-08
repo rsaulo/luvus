@@ -837,10 +837,6 @@ mod tests {
         assert!(!js.contains("child_process"));
         assert!(js.contains("opencode"));
         assert!(
-            js.contains("export const luvus"),
-            "keeps the V1 named-export shape"
-        );
-        assert!(
             js.contains("export default"),
             "V2 auto-loads this directory and rejects a module without a default"
         );

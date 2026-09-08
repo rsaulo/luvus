@@ -1892,6 +1892,7 @@ const RESIZE_GRAB_TOL: u16 = 2;
 /// header plus one line of content, so a dock can be made small but never
 /// squeezed into nothing the user then cannot grab back.
 pub(crate) const MIN_DOCK_HEIGHT: u16 = 3;
+
 impl Selection {
     /// (start, end) terminal cells in reading order (top-left → bottom-right).
     pub(crate) fn ordered(&self) -> ((u16, u16), (u16, u16)) {
@@ -10976,6 +10977,7 @@ mod tests {
             "its share is untouched"
         );
     }
+
     /// Dragging a divider moves the boundary between the two docks it separates
     /// and leaves the rest of the sidebar alone. Neither side can be squeezed
     /// past `MIN_DOCK_HEIGHT`, so a dock can always be grabbed back.
@@ -10989,7 +10991,8 @@ mod tests {
         app.sidebars.left.weights = Vec::new();
         // Stand in for a frame: a 30-row sidebar whose two chrome rows sit
         // above the dock body. The pair owns 27 rows (chrome plus the divider
-        // itself take the rest); the rule sits at row 15.        app.left_seam = Some(Rect::new(29, 0, 1, 30));
+        // itself take the rest); the rule sits at row 15.
+        app.left_seam = Some(Rect::new(29, 0, 1, 30));
         app.dock_dividers = vec![(Side::Left, 0, 15)];
 
         app.dock_resize = Some((Side::Left, 0));

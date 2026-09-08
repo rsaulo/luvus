@@ -253,7 +253,7 @@ pub(super) fn draw_sidebar(
                 session_rects = s;
             }
             DockKind::Files => super::files::draw_files_dock(f, slot, app, t),
-            DockKind::Module(id) => draw_module_dock(f, slot, &id, app, t),
+            DockKind::Module(id) => draw_module_dock(f, slot, id, app, t),
         }
     }
 
@@ -1092,6 +1092,7 @@ mod tests {
         );
         assert_eq!(dividers_again, dividers);
     }
+
     /// A weighted split hands out the sidebar in proportion, and still spends
     /// every row.
     #[test]
@@ -1144,6 +1145,7 @@ mod tests {
         let used: u16 = slots.iter().map(|s| s.height).sum::<u16>() + dividers.len() as u16;
         assert_eq!(used, body.height);
     }
+
     use crate::app::App;
     use crate::event::AppEvent;
     use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
