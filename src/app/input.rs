@@ -552,6 +552,14 @@ impl App {
                 self.apply_named_session_stopped(generation, name, result);
                 return true;
             }
+            AppEvent::NamedSessionDeleted {
+                generation,
+                name,
+                result,
+            } => {
+                self.apply_named_session_deleted(generation, name, result);
+                return true;
+            }
             other => other,
         };
         // Control-API requests and parked `wait.output` replies must be answered
@@ -673,6 +681,18 @@ impl App {
                 // Otherwise it goes to the focused pane.
                 self.paste_into_focused_pane(&s);
                 false // goes to the pane; its echo (PtyData) renders it
+            }
+            AppEvent::PasteImage(path) => {
+                // Image paths are terminal input, never modal text. Restrict
+                // delivery to the same normal focused-pane state that accepts
+                // ordinary typing so an image cannot leak through an overlay,
+                // native view, dashboard, or navigation mode.
+                if !self.focused_pane_accepts_image_paste() {
+                    crate::clipboard_image::discard_staged_png(&path);
+                    return false;
+                }
+                self.paste_into_focused_pane(&path.to_string_lossy());
+                false // the pane's echo is the event that changes the frame
             }
             AppEvent::Resize => {
                 // A resize (or a same-size resize event a terminal emits on a
@@ -1084,7 +1104,8 @@ impl App {
             | AppEvent::SearchHandoffReady { .. } => unreachable!(),
             AppEvent::NamedSessionsLoaded { .. }
             | AppEvent::NamedSessionPrepared { .. }
-            | AppEvent::NamedSessionStopped { .. } => {
+            | AppEvent::NamedSessionStopped { .. }
+            | AppEvent::NamedSessionDeleted { .. } => {
                 unreachable!()
             }
         }
@@ -1143,6 +1164,11 @@ impl App {
         // The picker owns both text sub-modes and direct path navigation.
         if self.picker.is_some() {
             self.picker_paste(s);
+            return true;
+        }
+        // The open-worktree list has no text input; swallow the paste so it
+        // can't leak into the pane under the modal.
+        if self.worktree_open.is_some() {
             return true;
         }
         if self.orch_form.is_some() {
@@ -1234,6 +1260,12 @@ impl App {
         let hit = |rect: Rect| c >= rect.x && c < rect.right() && r >= rect.y && r < rect.bottom();
         let first = |rects: &[Rect]| rects.iter().copied().find(|rect| hit(*rect));
 
+        if self.session_delete_confirm.is_some() {
+            return [self.modal_commit_rect, self.modal_cancel_rect]
+                .into_iter()
+                .flatten()
+                .find(|rect| hit(*rect));
+        }
         if self.named_session_menu.is_some() {
             if self.session_menu.is_some() {
                 if let Some(menu) = &self.session_menu {
@@ -1327,6 +1359,22 @@ impl App {
         }
         if let Some(menu) = &self.dock_menu {
             return first(&menu.rects);
+        }
+        // The open-worktree list hovers per row, not just on its footer buttons:
+        // without the row rects here, crossing from one row to the next would not
+        // count as a changed frame and the highlight would never repaint.
+        if self.worktree_open.is_some() {
+            return self
+                .worktree_open_rects
+                .iter()
+                .filter(|(target, _)| matches!(*target, PickerHit::Row(_)))
+                .map(|(_, rect)| *rect)
+                .chain(
+                    [self.modal_commit_rect, self.modal_cancel_rect]
+                        .into_iter()
+                        .flatten(),
+                )
+                .find(|rect| hit(*rect));
         }
         let modal_owns_mouse = self.file_prompt.is_some()
             || self.file_delete.is_some()
@@ -1438,6 +1486,12 @@ impl App {
             }
             return;
         }
+        if self.session_delete_confirm.is_some() {
+            if let Some(key) = self.modal_button_key(&m) {
+                self.session_delete_key(key);
+            }
+            return;
+        }
         if self.named_session_menu.is_some() {
             // Context menu on a session row owns the click first.
             if self.session_menu.is_some() {
@@ -1463,33 +1517,7 @@ impl App {
                             })
                             .map(|(i, _)| *i)
                         {
-                            if idx != 0 {
-                                // Keep `menu` bound here so `menu.preparing` is in scope.
-                                // The previous `.and_then(|menu| menu.rows.get(..))` moves
-                                // `menu` into the closure, so a naive `&& !menu.preparing`
-                                // at the row check would not compile.
-                                if let Some(menu) = self.named_session_menu.as_ref() {
-                                    if let Some(row) = menu.rows.get(idx - 1) {
-                                        if row.running && !row.current && !menu.preparing {
-                                            self.open_session_menu(
-                                                row.name.clone(),
-                                                m.column,
-                                                m.row,
-                                                row.running,
-                                                row.current,
-                                            );
-                                        } else {
-                                            self.session_menu = None;
-                                        }
-                                    } else {
-                                        self.session_menu = None;
-                                    }
-                                } else {
-                                    self.session_menu = None;
-                                }
-                            } else {
-                                self.session_menu = None;
-                            }
+                            self.open_session_menu_for_row(idx, m.column, m.row);
                         } else if !self.session_menu.as_ref().is_some_and(|menu| {
                             menu.items.iter().any(|(_, r)| {
                                 m.column >= r.x
@@ -1513,7 +1541,7 @@ impl App {
                     self.named_session_click(m.column, m.row)
                 }
                 MouseEventKind::Down(MouseButton::Right) => {
-                    // Right-click on a row → open Stop menu for running sessions only.
+                    // Right-click exposes the action valid for this row's state.
                     if let Some(idx) = self
                         .named_session_row_rects
                         .iter()
@@ -1525,23 +1553,7 @@ impl App {
                         })
                         .map(|(i, _)| *i)
                     {
-                        if idx != 0 {
-                            // Same reason as the guard above: bind `menu` first so
-                            // `!menu.preparing` is available (`.and_then` would hide it).
-                            if let Some(menu) = self.named_session_menu.as_ref() {
-                                if let Some(row) = menu.rows.get(idx - 1) {
-                                    if row.running && !row.current && !menu.preparing {
-                                        self.open_session_menu(
-                                            row.name.clone(),
-                                            m.column,
-                                            m.row,
-                                            row.running,
-                                            row.current,
-                                        );
-                                    }
-                                }
-                            }
-                        }
+                        self.open_session_menu_for_row(idx, m.column, m.row);
                     }
                 }
                 MouseEventKind::ScrollUp => self.move_named_session_cursor(-1),
@@ -1856,14 +1868,69 @@ impl App {
         if self.compact && m.row < self.last_pane_area.y {
             return;
         }
-        // Text-input modals: only the ⏎/esc footer buttons respond to the mouse;
-        // any other click is swallowed (the centered modal owns the screen).
+        // The new-worktree prompt: the ⏎/esc footer buttons act as those keys,
+        // a click on the modal body is inert, and a click on the dimmed backdrop
+        // cancels — the same gesture as the open-worktree list below.
         if self.worktree_prompt.is_some() {
             if let Some(k) = self.modal_button_key(&m) {
                 self.handle_worktree_prompt_key(k);
+            } else if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+                // Only a rendered prompt knows where its body is; until then
+                // the click is swallowed rather than guessed as "outside".
+                let outside = self.worktree_prompt_rect.is_some_and(|rect| {
+                    m.column < rect.x
+                        || m.column >= rect.right()
+                        || m.row < rect.y
+                        || m.row >= rect.bottom()
+                });
+                if outside {
+                    self.handle_worktree_prompt_key(KeyEvent::new(
+                        KeyCode::Esc,
+                        KeyModifiers::NONE,
+                    ));
+                }
             }
             return;
         }
+        // The open-worktree list is a list, not a text field: it owns the mouse
+        // the way the folder picker does — a click opens the row under it, the
+        // wheel moves the cursor, and the dimmed backdrop cancels.
+        if self.worktree_open.is_some() {
+            match m.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    // The footer buttons come first: they overlay the modal body,
+                    // which would otherwise swallow them as inert chrome.
+                    if let Some(k) = self.modal_button_key(&m) {
+                        self.handle_worktree_open_key(k);
+                        return;
+                    }
+                    let (c, r) = (m.column, m.row);
+                    let hit = self
+                        .worktree_open_rects
+                        .iter()
+                        .find(|(_, rect)| {
+                            c >= rect.x && c < rect.right() && r >= rect.y && r < rect.bottom()
+                        })
+                        .map(|(hit, _)| *hit);
+                    match hit {
+                        Some(PickerHit::Row(i)) => self.worktree_open_click(i),
+                        // Inert modal surface; the footer is handled above.
+                        Some(PickerHit::Hint(_)) | Some(PickerHit::Modal) => {}
+                        None => self.close_worktree_list(), // click outside cancels
+                    }
+                }
+                MouseEventKind::ScrollUp => {
+                    self.handle_worktree_open_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+                }
+                MouseEventKind::ScrollDown => {
+                    self.handle_worktree_open_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+                }
+                _ => {}
+            }
+            return;
+        }
+        // Text-input modals: only the ⏎/esc footer buttons respond to the mouse;
+        // any other click is swallowed (the centered modal owns the screen).
         if self.tab_rename.is_some() {
             if let Some(k) = self.modal_button_key(&m) {
                 self.handle_tab_rename_key(k);
@@ -2354,7 +2421,7 @@ impl App {
                     }
                     Some(crate::app::ViewKind::Diff(v)) => {
                         let is_split = v.effective_split(rect.width);
-                        if hscroll != 0 {
+                        if hscroll != 0 && !v.effective_wrap(rect.width) {
                             if hscroll < 0 {
                                 v.horizontal = v.horizontal.saturating_sub(8);
                             } else {
@@ -2893,8 +2960,14 @@ impl App {
                     // forwarded, so typing to the agent resumes with no lost key.
                     pane.scroll_to_bottom();
                     exit = true;
-                    let (app_cursor, disambiguate) = pane.key_encoding_modes();
-                    if let Some(bytes) = encode_key(&key, newline, app_cursor, disambiguate) {
+                    let modes = pane.key_encoding_modes();
+                    if let Some(bytes) = encode_key_with_modes(
+                        &key,
+                        newline,
+                        modes.application_cursor,
+                        modes.disambiguate_escape_codes,
+                        modes.report_all_keys_as_escape_codes,
+                    ) {
                         pane.send(&bytes);
                     }
                 }
@@ -3596,6 +3669,50 @@ impl App {
         target
     }
 
+    /// Whether the current input owner is the normal focused terminal pane.
+    /// Dedicated image paste is intentionally stricter than text paste because
+    /// a Luvus modal has no meaningful image value to accept.
+    fn focused_pane_accepts_image_paste(&self) -> bool {
+        self.mode == Mode::Normal
+            && self.bar.overflow.is_none()
+            && self.cmd_inspect.is_none()
+            && !self.help_open
+            && !self.changelog_open
+            && self.module_setting_edit.is_none()
+            && self.named_session_menu.is_none()
+            && self.settings.is_none()
+            && self.search.is_none()
+            && self.picker.is_none()
+            && self.worktree_prompt.is_none()
+            && self.worktree_open.is_none()
+            && self.tab_rename.is_none()
+            && self.tab_menu.is_none()
+            && self.ws_menu.is_none()
+            && self.pane_menu.is_none()
+            && self.agent_menu.is_none()
+            && self.file_prompt.is_none()
+            && self.file_delete.is_none()
+            && self.worktree_delete.is_none()
+            && self.file_menu.is_none()
+            && self.diff_menu.is_none()
+            && self.orch_menu.is_none()
+            && self.dock_menu.is_none()
+            && !self.switcher
+            && self.pane_rename.is_none()
+            && self.ws_rename.is_none()
+            && self.orch_form.is_none()
+            && self.orch_start.is_none()
+            && self.orch_detail.is_none()
+            && self.scroll_pane.is_none()
+            && self.copy_mode.is_none()
+            && self.sidebar_focus.is_none()
+            && !self.files_focused
+            && !self.active_is_git()
+            && !self.active_is_orch()
+            && !self.active_is_mission()
+            && self.focused().is_some()
+    }
+
     /// Record that the user just typed into the focused pane, so detection can
     /// tell typing (whose echo is PTY output) apart from the agent generating
     /// (docs/07). Only the focused pane receives typed input.
@@ -3715,6 +3832,10 @@ impl App {
             self.handle_module_setting_key(key);
             return true;
         }
+        if self.session_delete_confirm.is_some() {
+            self.session_delete_key(key);
+            return true;
+        }
         if self.named_session_menu.is_some() {
             // Context menu Esc should close the menu before the session popup.
             if self.session_menu.is_some() && key.code == KeyCode::Esc {
@@ -3746,6 +3867,11 @@ impl App {
         // The new-worktree branch prompt captures all input while open.
         if self.worktree_prompt.is_some() {
             self.handle_worktree_prompt_key(key);
+            return true;
+        }
+        // The open-worktree list modal captures all input while open.
+        if self.worktree_open.is_some() {
+            self.handle_worktree_open_key(key);
             return true;
         }
         // The tab-rename modal (docs/28) captures all input while open.
@@ -3911,9 +4037,14 @@ impl App {
                     let prefix = self.prefix.key_event();
                     let newline = self.config.shift_enter_bytes().to_vec();
                     if let Some(pane) = self.focused() {
-                        let (app_cursor, disambiguate) = pane.key_encoding_modes();
-                        if let Some(bytes) = encode_key(&prefix, &newline, app_cursor, disambiguate)
-                        {
+                        let modes = pane.key_encoding_modes();
+                        if let Some(bytes) = encode_key_with_modes(
+                            &prefix,
+                            &newline,
+                            modes.application_cursor,
+                            modes.disambiguate_escape_codes,
+                            modes.report_all_keys_as_escape_codes,
+                        ) {
                             pane.send(&bytes);
                         }
                     }
@@ -4006,11 +4137,17 @@ impl App {
                 let newline = self.config.shift_enter_bytes();
                 // Cursor keys follow the pane's DECCKM state: a `less` that
                 // turned application cursor mode on only recognizes SS3 codes.
-                let (app_cursor, disambiguate) = self
+                let modes = self
                     .focused()
                     .map(|pane| pane.key_encoding_modes())
-                    .unwrap_or((false, false));
-                if let Some(bytes) = encode_key(&key, newline, app_cursor, disambiguate) {
+                    .unwrap_or_default();
+                if let Some(bytes) = encode_key_with_modes(
+                    &key,
+                    newline,
+                    modes.application_cursor,
+                    modes.disambiguate_escape_codes,
+                    modes.report_all_keys_as_escape_codes,
+                ) {
                     if let Some(p) = self.focused() {
                         // Typing snaps the view back to the live bottom, so you
                         // always see what you type (like every terminal).
@@ -4129,17 +4266,34 @@ fn mouse_wheel_seq(up: bool, col: u16, row: u16, sgr: bool) -> Vec<u8> {
 /// `app_cursor` mirrors the pane's DECCKM state: cursor keys go out as SS3
 /// (`ESC O <letter>`) when the app enabled application cursor mode, exactly as a
 /// real terminal would send them — some apps (`less`) only recognize the SS3
-/// form once they've turned the mode on.
+/// form once they've turned the mode on. Unnegotiated Alt+character stays
+/// ESC+char; after Kitty disambiguate it is CSI-u so `Alt+/` is not two keys.
+/// `report_all` is tracked separately because disambiguation alone deliberately
+/// leaves Tab and Backspace in their legacy forms.
+#[cfg(test)]
 fn encode_key(
     key: &KeyEvent,
     newline: &[u8],
     app_cursor: bool,
     disambiguate: bool,
 ) -> Option<Vec<u8>> {
+    encode_key_with_modes(key, newline, app_cursor, disambiguate, false)
+}
+
+fn encode_key_with_modes(
+    key: &KeyEvent,
+    newline: &[u8],
+    app_cursor: bool,
+    disambiguate: bool,
+    report_all: bool,
+) -> Option<Vec<u8>> {
     // AltGr arrives as Ctrl+Alt on Windows (`keys::is_ctrl_chord`) and types a
     // character — it is neither a Ctrl chord nor an `ESC`-prefixed Alt key.
     let ctrl = super::keys::is_ctrl_chord(key.modifiers);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
+    // Kitty's report-all mode implies disambiguation, even when the child did
+    // not also set the dedicated disambiguation bit.
+    let disambiguate = disambiguate || report_all;
     // True exactly when `is_ctrl_chord` refused a Ctrl+Alt press as AltGr. Only
     // the `Char` arm may act on it: every other key keeps both modifiers, so
     // `Ctrl+Alt+Enter` is still a modified Enter and sends the newline sequence.
@@ -4148,12 +4302,27 @@ fn encode_key(
 
     let bytes: Vec<u8> = match key.code {
         KeyCode::Char(c) => {
-            if ctrl {
-                if disambiguate {
+            if report_all
+                && !altgr
+                && modified_char_has_canonical_identity(c, key.modifiers, cfg!(windows))
+            {
+                let codepoint = if ctrl && matches!(c, '/' | '7') {
+                    '/'
+                } else if c.is_alphabetic() {
+                    single_lowercase_codepoint(c)
+                } else {
+                    c
+                };
+                return Some(csi_u_char(codepoint, key.modifiers));
+            } else if ctrl {
+                if disambiguate
+                    && modified_char_has_canonical_identity(c, key.modifiers, cfg!(windows))
+                {
                     // Once the nested application opts into Kitty keyboard
-                    // disambiguation, every Ctrl+character chord uses CSI-u.
-                    // This preserves the protocol's key identity instead of
-                    // mixing negotiated CSI-u with legacy control bytes.
+                    // disambiguation, every Ctrl+character chord with a known
+                    // canonical identity uses CSI-u. This preserves the key
+                    // identity instead of mixing negotiated CSI-u with legacy
+                    // control bytes.
                     let codepoint = match c {
                         // Crossterm represents a legacy 0x1f input byte as
                         // Ctrl+7. The originating terminal could not
@@ -4176,6 +4345,22 @@ fn encode_key(
                 } else {
                     vec![b]
                 }
+            } else if disambiguate
+                && !altgr
+                && (alt
+                    || key
+                        .modifiers
+                        .intersects(KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META))
+                && modified_char_has_canonical_identity(c, key.modifiers, cfg!(windows))
+            {
+                // Kitty disambiguate reports alt/super+key as CSI-u instead of
+                // ESC+char or a Super-stripped character.
+                let codepoint = if shift && c.is_alphabetic() {
+                    single_lowercase_codepoint(c)
+                } else {
+                    c
+                };
+                return Some(csi_u_char(codepoint, key.modifiers));
             } else {
                 let mut s = c.to_string().into_bytes();
                 if alt && !altgr {
@@ -4195,17 +4380,42 @@ fn encode_key(
         // (`config::shift_enter`); the default `ESC CR` is what agents expect out
         // of the box (Claude Code's `/terminal-setup`).
         KeyCode::Enter if shift || alt => newline.to_vec(),
+        KeyCode::Enter if report_all => csi_u_code(13, key.modifiers),
         KeyCode::Enter => vec![b'\r'],
-        KeyCode::Tab => vec![b'\t'],
-        KeyCode::BackTab => vec![0x1b, b'[', b'Z'],
+        KeyCode::Tab => {
+            if report_all {
+                csi_u_code(9, key.modifiers)
+            } else {
+                vec![b'\t']
+            }
+        }
+        KeyCode::BackTab => {
+            if report_all {
+                let mut modifiers = key.modifiers;
+                modifiers.insert(KeyModifiers::SHIFT);
+                csi_u_code(9, modifiers)
+            } else {
+                vec![0x1b, b'[', b'Z']
+            }
+        }
         KeyCode::Backspace => {
-            if alt {
+            if report_all {
+                csi_u_code(127, key.modifiers)
+            } else if alt {
                 vec![0x1b, 0x7f]
             } else {
                 vec![0x7f]
             }
         }
-        KeyCode::Esc => vec![0x1b],
+        KeyCode::Esc => {
+            if disambiguate {
+                csi_u_code(27, key.modifiers)
+            } else if alt {
+                vec![0x1b, 0x1b]
+            } else {
+                vec![0x1b]
+            }
+        }
         // Keep navigation modifiers intact. Crossterm reports these directly
         // from Windows console records, while terminals on Unix report them via
         // xterm/Kitty escape sequences. Dropping the modifiers here turned
@@ -4248,6 +4458,18 @@ fn encode_key(
     Some(bytes)
 }
 
+/// A native Windows key event can contain only the shifted punctuation and its
+/// Shift modifier, not the unshifted key identity Kitty requires. Keep those
+/// combinations on the pre-existing legacy path until the Windows input layer
+/// can preserve the virtual-key or scan-code identity alongside the event.
+fn modified_char_has_canonical_identity(
+    character: char,
+    modifiers: KeyModifiers,
+    windows: bool,
+) -> bool {
+    !windows || !modifiers.contains(KeyModifiers::SHIFT) || character.is_alphabetic()
+}
+
 /// Lowercase a key identity only when Unicode maps it to exactly one scalar.
 fn single_lowercase_codepoint(character: char) -> char {
     let mut lowercase = character.to_lowercase();
@@ -4280,12 +4502,16 @@ fn csi(final_byte: u8) -> Vec<u8> {
 }
 
 fn csi_u_char(character: char, modifiers: KeyModifiers) -> Vec<u8> {
-    format!(
-        "\x1b[{};{}u",
-        character as u32,
-        key_modifier_param(modifiers)
-    )
-    .into_bytes()
+    csi_u_code(u32::from(character), modifiers)
+}
+
+fn csi_u_code(codepoint: u32, modifiers: KeyModifiers) -> Vec<u8> {
+    let modifier = key_modifier_param(modifiers);
+    if modifier == 1 {
+        format!("\x1b[{codepoint}u").into_bytes()
+    } else {
+        format!("\x1b[{codepoint};{modifier}u").into_bytes()
+    }
 }
 
 /// Encode a cursor key (arrows / Home / End). In application cursor mode
@@ -4351,6 +4577,35 @@ mod tests {
             app.orch_form.as_ref().unwrap().prompt,
             "first\nsecond\nthirdline"
         );
+    }
+
+    #[test]
+    fn image_path_paste_reaches_only_a_normal_focused_pane() {
+        let _env = crate::persist::test_env("image-path-paste-route");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(80, 24, tx).unwrap();
+        let focus = app.layout().focus;
+        let (input_tx, input_rx) = std::sync::mpsc::channel();
+        app.panes
+            .get_mut(&focus)
+            .unwrap()
+            .replace_input_sender_for_test(input_tx);
+
+        let path = std::path::PathBuf::from("clipboard-images/example.png");
+        assert!(!app.handle_event(AppEvent::PasteImage(path.clone())));
+        let crate::terminal::pty::InputAction::Bytes(bytes) = input_rx.try_recv().unwrap() else {
+            panic!("image path should use the ordinary paste queue");
+        };
+        assert_eq!(bytes, path.to_string_lossy().as_bytes());
+
+        app.help_open = true;
+        let png = crate::clipboard_image::encode_rgba_png(1, 1, |_, _| [1, 2, 3, 255])
+            .expect("fixture PNG");
+        let blocked = crate::clipboard_image::stage_png(&png).expect("staged image");
+        assert!(!app.handle_event(AppEvent::PasteImage(blocked.clone())));
+        assert!(input_rx.try_recv().is_err());
+        assert!(app.help_open, "the image gesture must not dismiss help");
+        assert!(!blocked.exists(), "rejected image must not remain staged");
     }
 
     #[test]
@@ -4849,6 +5104,40 @@ mod tests {
     }
 
     #[test]
+    fn alt_punctuation_uses_csi_u_only_after_negotiation() {
+        let encode = |character, disambiguate| {
+            encode_key(
+                &KeyEvent::new(KeyCode::Char(character), KeyModifiers::ALT),
+                b"\x1b\r",
+                false,
+                disambiguate,
+            )
+        };
+
+        assert_eq!(encode('/', false), Some(b"\x1b/".to_vec()));
+        assert_eq!(encode(';', false), Some(b"\x1b;".to_vec()));
+        assert_eq!(encode('a', false), Some(b"\x1ba".to_vec()));
+
+        assert_eq!(encode('/', true), Some(b"\x1b[47;3u".to_vec()));
+        assert_eq!(encode(';', true), Some(b"\x1b[59;3u".to_vec()));
+        assert_eq!(encode('\'', true), Some(b"\x1b[39;3u".to_vec()));
+        assert_eq!(encode('a', true), Some(b"\x1b[97;3u".to_vec()));
+        assert_eq!(
+            encode_key(
+                &KeyEvent::new(KeyCode::Char('/'), KeyModifiers::ALT | KeyModifiers::SHIFT),
+                b"\x1b\r",
+                false,
+                true,
+            ),
+            Some(if cfg!(windows) {
+                b"\x1b/".to_vec()
+            } else {
+                b"\x1b[47;4u".to_vec()
+            })
+        );
+    }
+
+    #[test]
     fn alt_backspace_sends_meta_delete_for_word_deletion() {
         let key = |modifiers, disambiguate| {
             encode_key(
@@ -4859,10 +5148,127 @@ mod tests {
             )
         };
 
+        assert_eq!(key(KeyModifiers::NONE, false), Some(vec![0x7f]));
+        assert_eq!(key(KeyModifiers::NONE, true), Some(vec![0x7f]));
+        assert_eq!(key(KeyModifiers::ALT, false), Some(vec![0x1b, 0x7f]));
+        assert_eq!(key(KeyModifiers::ALT, true), Some(vec![0x1b, 0x7f]));
+        assert_eq!(key(KeyModifiers::CONTROL, false), Some(vec![0x7f]));
+        assert_eq!(key(KeyModifiers::CONTROL, true), Some(vec![0x7f]));
+    }
+
+    #[test]
+    fn tab_and_backspace_require_report_all_for_csi_u() {
+        let encode = |code, modifiers, disambiguate, report_all| {
+            encode_key_with_modes(
+                &KeyEvent::new(code, modifiers),
+                b"\x1b\r",
+                false,
+                disambiguate,
+                report_all,
+            )
+        };
+
         for disambiguate in [false, true] {
-            assert_eq!(key(KeyModifiers::NONE, disambiguate), Some(vec![0x7f]));
-            assert_eq!(key(KeyModifiers::ALT, disambiguate), Some(vec![0x1b, 0x7f]));
+            assert_eq!(
+                encode(KeyCode::Tab, KeyModifiers::CONTROL, disambiguate, false),
+                Some(b"\t".to_vec())
+            );
+            assert_eq!(
+                encode(KeyCode::BackTab, KeyModifiers::NONE, disambiguate, false),
+                Some(b"\x1b[Z".to_vec())
+            );
+            assert_eq!(
+                encode(KeyCode::Backspace, KeyModifiers::ALT, disambiguate, false),
+                Some(vec![0x1b, 0x7f])
+            );
         }
+
+        assert_eq!(
+            encode(KeyCode::Tab, KeyModifiers::CONTROL, false, true),
+            Some(b"\x1b[9;5u".to_vec())
+        );
+        assert_eq!(
+            encode(KeyCode::Tab, KeyModifiers::ALT, false, true),
+            Some(b"\x1b[9;3u".to_vec())
+        );
+        assert_eq!(
+            encode(KeyCode::BackTab, KeyModifiers::NONE, false, true),
+            Some(b"\x1b[9;2u".to_vec())
+        );
+        assert_eq!(
+            encode(KeyCode::Backspace, KeyModifiers::ALT, false, true),
+            Some(b"\x1b[127;3u".to_vec())
+        );
+        assert_eq!(
+            encode(KeyCode::Backspace, KeyModifiers::CONTROL, false, true),
+            Some(b"\x1b[127;5u".to_vec())
+        );
+        assert_eq!(
+            encode(KeyCode::Enter, KeyModifiers::NONE, false, true),
+            Some(b"\x1b[13u".to_vec())
+        );
+        assert_eq!(
+            encode(KeyCode::Char('a'), KeyModifiers::NONE, false, true),
+            Some(b"\x1b[97u".to_vec())
+        );
+        assert_eq!(
+            encode(KeyCode::Char('A'), KeyModifiers::SHIFT, false, true),
+            Some(b"\x1b[97;2u".to_vec())
+        );
+        assert_eq!(
+            encode(KeyCode::Char('7'), KeyModifiers::CONTROL, false, true),
+            Some(b"\x1b[47;5u".to_vec())
+        );
+    }
+
+    #[test]
+    fn disambiguate_and_report_all_encode_esc_and_modified_chars() {
+        let encode = |code, modifiers, disambiguate, report_all| {
+            encode_key_with_modes(
+                &KeyEvent::new(code, modifiers),
+                b"\x1b\r",
+                false,
+                disambiguate,
+                report_all,
+            )
+        };
+
+        assert_eq!(
+            encode(KeyCode::Esc, KeyModifiers::NONE, false, false),
+            Some(vec![0x1b])
+        );
+        for modes in [(true, false), (false, true)] {
+            assert_eq!(
+                encode(KeyCode::Esc, KeyModifiers::NONE, modes.0, modes.1),
+                Some(b"\x1b[27u".to_vec())
+            );
+            assert_eq!(
+                encode(KeyCode::Esc, KeyModifiers::ALT, modes.0, modes.1),
+                Some(b"\x1b[27;3u".to_vec())
+            );
+            assert_eq!(
+                encode(KeyCode::Char('a'), KeyModifiers::SUPER, modes.0, modes.1),
+                Some(b"\x1b[97;9u".to_vec())
+            );
+        }
+        assert_eq!(
+            encode(KeyCode::Esc, KeyModifiers::ALT, false, false),
+            Some(vec![0x1b, 0x1b])
+        );
+        assert_eq!(
+            encode(KeyCode::Char('a'), KeyModifiers::SUPER, false, false),
+            Some(b"a".to_vec())
+        );
+    }
+
+    #[test]
+    fn windows_shifted_punctuation_is_excluded_from_csi_u_without_key_identity() {
+        let alt_shift = KeyModifiers::ALT | KeyModifiers::SHIFT;
+        assert!(!modified_char_has_canonical_identity('?', alt_shift, true));
+        assert!(!modified_char_has_canonical_identity('/', alt_shift, true));
+        assert!(!modified_char_has_canonical_identity('€', alt_shift, true));
+        assert!(modified_char_has_canonical_identity('A', alt_shift, true));
+        assert!(modified_char_has_canonical_identity('?', alt_shift, false));
     }
 
     #[test]

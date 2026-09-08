@@ -9,6 +9,7 @@ mod automation;
 mod bar;
 mod changelog;
 mod cli;
+mod clipboard_image;
 mod config;
 mod detect;
 mod diff;
@@ -45,11 +46,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
-#[cfg(windows)]
-use ratatui::crossterm::event::poll as poll_event;
+#[cfg(not(windows))]
+use ratatui::crossterm::event::read as read_event;
 use ratatui::crossterm::event::{
-    read as read_event, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture,
-    EnableBracketedPaste, EnableFocusChange, EnableMouseCapture, Event, KeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event, KeyboardEnhancementFlags,
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::execute;
@@ -1318,6 +1319,8 @@ fn run(terminal: &mut DefaultTerminal) -> Result<bool> {
         EnableFocusChange,
         crossterm::terminal::SetTitle(window_title())
     );
+    #[cfg(windows)]
+    let _windows_input_mode = terminal::host_input::enable_input_mode();
     push_key_protocol();
     {
         let tx = tx.clone();
@@ -1432,32 +1435,7 @@ fn remove_unbound_socket(path: &Path) -> std::io::Result<()> {
 fn input_loop(tx: Sender<AppEvent>, pending: Vec<Event>) {
     #[cfg(windows)]
     {
-        let mut decoder = crate::terminal::host_input::HostInputDecoder::default();
-        for event in pending {
-            if !send_decoded_input(&tx, decoder.push(event)) {
-                return;
-            }
-        }
-        loop {
-            if let Some(timeout) = decoder.wait_timeout() {
-                match poll_event(timeout) {
-                    Ok(false) => {
-                        if !send_decoded_input(&tx, decoder.flush_expired()) {
-                            break;
-                        }
-                        continue;
-                    }
-                    Ok(true) => {}
-                    Err(_) => break,
-                }
-            }
-            let Ok(event) = read_event() else {
-                break;
-            };
-            if !send_decoded_input(&tx, decoder.push(event)) {
-                break;
-            }
-        }
+        crate::terminal::host_input::run_input_loop(pending, |event| send_input_event(&tx, event));
     }
 
     #[cfg(not(windows))]
@@ -1479,22 +1457,21 @@ fn send_input_event(tx: &Sender<AppEvent>, event: Event) -> bool {
     app_event(event).is_none_or(|event| tx.send(event).is_ok())
 }
 
-#[cfg(windows)]
-fn send_decoded_input(
-    tx: &Sender<AppEvent>,
-    decoded: crate::terminal::host_input::DecodedEvents,
-) -> bool {
-    let mut connected = true;
-    decoded.for_each(|event| {
-        if connected {
-            connected = send_input_event(tx, event);
-        }
-    });
-    connected
+fn app_event(event: Event) -> Option<AppEvent> {
+    app_event_with_image(event, || {
+        crate::platform::clipboard_image()
+            .and_then(|png| crate::clipboard_image::stage_png(&png).ok())
+    })
 }
 
-fn app_event(event: Event) -> Option<AppEvent> {
+fn app_event_with_image(
+    event: Event,
+    image: impl FnOnce() -> Option<std::path::PathBuf>,
+) -> Option<AppEvent> {
     match crate::terminal::host_key::normalize_platform_modifiers(event) {
+        Event::Key(k) if crate::clipboard_image::is_image_paste_key(&k) => {
+            image().map(AppEvent::PasteImage).or(Some(AppEvent::Key(k)))
+        }
         Event::Key(k) => Some(AppEvent::Key(k)),
         Event::Mouse(m) => Some(AppEvent::Mouse(m)),
         Event::Resize(_, _) => Some(AppEvent::Resize),
@@ -1517,6 +1494,23 @@ mod tests {
         let _env = crate::persist::test_env("stop-absent");
         crate::persist::ensure_session_dir();
         assert!(!send_server_stop().expect("absent server is not an error"));
+    }
+
+    #[test]
+    fn local_image_paste_uses_a_staged_path_and_falls_back_to_the_key() {
+        let key = ratatui::crossterm::event::KeyEvent::new(
+            ratatui::crossterm::event::KeyCode::Char('v'),
+            ratatui::crossterm::event::KeyModifiers::CONTROL,
+        );
+        let path = std::path::PathBuf::from("clipboard-images/example.png");
+        assert!(matches!(
+            app_event_with_image(Event::Key(key), || Some(path.clone())),
+            Some(AppEvent::PasteImage(staged)) if staged == path
+        ));
+        assert!(matches!(
+            app_event_with_image(Event::Key(key), || None),
+            Some(AppEvent::Key(fallback)) if fallback == key
+        ));
     }
 
     #[test]

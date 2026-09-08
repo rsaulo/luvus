@@ -86,7 +86,7 @@ panes / agents:
   pane focus <id>            focus a pane (jumps to its workspace/tab)
   pane move [<id>] (--tab <n> | --new-tab)  move a pane within its workspace
   pane run [<id>] <cmd...>   run a command in a pane
-  pane send [<id>] <text>    send raw text to a pane
+  pane send [<id>] <text>    paste text into a pane
   pane read [<id>]           print a pane's recent output
   pane status [<id>]         print a pane's agent status and history metrics (any workspace)
   pane processes [<id>]      list cached executable identities without exposing arguments
@@ -295,3 +295,26 @@ inserted beside that target in the same workspace and tab. It starts in the
 target pane's live working directory; with
 `layout.new_pane_to_workspace_root = true`, it starts at the target workspace
 root instead. `--no-focus` preserves the caller's current view.
+
+`luvus uhp capabilities` on the owner endpoint reports supported methods. The same RPC through paired `luvus uhp access` adds `access.mode`, `access.allowed_methods`, and gateway connection/request limits; use that effective set for permission-aware clients.
+
+## Prompt wait observation
+
+With `--wait`, `agent prompt` (also `agent send`) requires a new `working` or
+`blocked` transition before the requested `--until` state can complete the wait.
+An unchanged status, title flicker, or quiet output alone cannot complete it.
+`observed_state` records the first active transition; `status` is the current state.
+The absolute `--timeout` covers both stages (default 300 seconds). Timeout returns
+`matched:false`, `evidence:"timeout"`, and a null `observed_state` if no transition
+was seen. Pane or terminal exit returns `agent_not_running` with `pane`, `queued`,
+`submitted`, `observed_state`, `reason:"pane_closed"`, `baseline_revision`, and
+`content_revision` under `error.data`. Timeout and pane exit during a wait use CLI
+exit code 2. Cancellation, timeout, and exit release pending wait ownership.
+Without `--wait`, the immediate `submitted:true`, `evidence:"queued"` response is
+unchanged and omits `observed_state`. Submission still means queue admission;
+state transitions do not confirm consumption of the prompt text. Do not resend
+automatically after a timeout or lost response because queued input may execute.
+When the current screen is a detected startup, sign-in, selection, or approval
+surface, prompt submission returns `agent_not_ready` without queuing text or
+Enter. Inspect it with `agent read`; use `agent keys` only for an intentional
+interaction.

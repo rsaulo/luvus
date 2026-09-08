@@ -93,6 +93,7 @@ Keyboard → Keyboard Shortcuts → Input Sources** to free `Ctrl+Space`.
 | Codex | ✓ | ✓ | ✓ |
 | Antigravity CLI | ✓ | ✓ | session only |
 | opencode | ✓ | ✓ | ✓ |
+| OpenCode 2 Preview | ✓ | exact-ID resume | No |
 | Kimi | ✓ | ✓ | ✓ |
 | Grok | ✓ | ✓ | ✓ |
 | Hermes CLI | ✓ | ✓ with integration | session only |
@@ -101,6 +102,7 @@ Keyboard → Keyboard Shortcuts → Input Sources** to free `Ctrl+Space`.
 | Muse Code | ✓ | ✓ | No |
 | Fx | ✓ | ✓ | No |
 | Cursor | ✓ | resume command | No |
+| Kilo Code | ✓ | exact-ID resume | No |
 | Gemini · Aider · Amp · Droid · Qwen · Kiro | ✓ | No | No |
 
 Live status needs no agent integration. See the

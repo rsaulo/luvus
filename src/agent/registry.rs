@@ -7,9 +7,11 @@ pub(crate) static BUILTINS: &[&AgentDescriptor] = &[
     &super::antigravity::DESCRIPTOR,
     &super::aider::DESCRIPTOR,
     &super::opencode::DESCRIPTOR,
+    &super::opencode2::DESCRIPTOR,
     &super::copilot::DESCRIPTOR,
     &super::kimi::DESCRIPTOR,
     &super::qwen::DESCRIPTOR,
+    &super::kilo::DESCRIPTOR,
     &super::kiro::DESCRIPTOR,
     &super::cursor::DESCRIPTOR,
     &super::amp::DESCRIPTOR,
@@ -144,6 +146,16 @@ mod tests {
         assert!(pi.supports(AutomationAccess::ReadOnly));
         assert!(!pi.supports(AutomationAccess::Workspace));
         assert!(!pi.supports(AutomationAccess::FullAccess));
+
+        let kilo = find("kilo").unwrap().automation.unwrap();
+        assert!(!kilo.supports(AutomationAccess::ReadOnly));
+        assert!(!kilo.supports(AutomationAccess::Workspace));
+        assert!(kilo.supports(AutomationAccess::FullAccess));
+
+        let opencode2 = find("opencode2").unwrap().automation.unwrap();
+        assert!(!opencode2.supports(AutomationAccess::ReadOnly));
+        assert!(!opencode2.supports(AutomationAccess::Workspace));
+        assert!(opencode2.supports(AutomationAccess::FullAccess));
     }
 
     #[test]
@@ -182,6 +194,7 @@ mod tests {
         assert_eq!(find("cursor-agent").map(|agent| agent.id), Some("cursor"));
         assert_eq!(find("CURSOR").map(|agent| agent.id), Some("cursor"));
         assert_eq!(find("agy").map(|agent| agent.id), Some("antigravity"));
+        assert_eq!(find("KILOCODE").map(|agent| agent.id), Some("kilo"));
         assert_eq!(
             find("ANTIGRAVITY-CLI").map(|agent| agent.id),
             Some("antigravity")
@@ -208,9 +221,11 @@ mod tests {
             ("antigravity", &["antigravity-cli"][..], &["agy"][..]),
             ("aider", &["aider"][..], &[][..]),
             ("opencode", &["opencode"][..], &[][..]),
+            ("opencode2", &["opencode2"][..], &[][..]),
             ("copilot", &["copilot"][..], &[][..]),
             ("kimi", &["kimi"][..], &[][..]),
             ("qwen", &["qwen"][..], &[][..]),
+            ("kilo", &["kilocode"][..], &["kilo"][..]),
             ("kiro", &["kiro"][..], &[][..]),
             ("cursor", &["cursor-agent"][..], &["cursor"][..]),
             ("amp", &[][..], &["amp"][..]),
@@ -253,9 +268,11 @@ mod tests {
                 "gemini",
                 "antigravity",
                 "opencode",
+                "opencode2",
                 "copilot",
                 "kimi",
                 "qwen",
+                "kilo",
                 "cursor",
                 "grok",
                 "hermes",
@@ -307,7 +324,7 @@ mod tests {
             })
             .map(|descriptor| descriptor.id)
             .collect();
-        assert_eq!(forkable, ["claude", "codex", "grok", "omp", "pi"]);
+        assert_eq!(forkable, ["claude", "codex", "kilo", "grok", "omp", "pi"]);
 
         assert_eq!(
             integrations()

@@ -84,10 +84,11 @@ for an agent to receive it:
 `luvus skill enable` makes no network request. It installs the same bundled
 skill into detected native skill locations without overwriting external or
 modified content. The shared `~/.agents/skills/luvus/` copy serves Codex,
-GitHub Copilot CLI, Gemini CLI, Pi, Cursor, Amp, Droid, and fx. Dedicated
-adapters serve Claude Code, OpenCode, Kimi Code CLI, Grok Build, Hermes CLI,
-Qwen Code, and Kiro. Aider has no native Agent Skills installation surface, so
-use `luvus skill show` when an Aider conversation needs the instructions.
+GitHub Copilot CLI, Gemini CLI, Pi, Cursor, Amp, Droid, fx, and Kilo Code.
+Dedicated adapters serve Claude Code, OpenCode, OpenCode 2 Preview, Kimi Code
+CLI, Grok Build, Hermes CLI, Qwen Code, and Kiro. Aider has no native Agent
+Skills installation surface, so use `luvus skill show` when an Aider
+conversation needs the instructions.
 
 Start a new agent conversation after installation, or use that agent's skill
 reload command when it provides one. To remove unchanged Luvus-managed copies:
@@ -280,6 +281,13 @@ user named a specific project.
 `agent prompt` submits one complete prompt and can wait semantically. Prefer it
 to separate text and Enter operations. A timeout does not prove that an agent
 failed or stopped. Inspect it before deciding what to do next.
+For `agent.send` and `agent.prompt`, detected blocked prompt evidence—including
+in non-Codex panes—rejects submission with `agent_not_ready` before either text
+or Enter is queued. Startup, sign-in, selection, and approval screens are
+examples, not an exhaustive list. A server-launched or restored Codex pane with
+an `agent_session` also returns `agent_not_ready` when prompt evidence is
+Unknown, unless live Codex composer geometry reports Ready. Existing Codex panes
+without that requirement retain the permissive Unknown-evidence fallback.
 
 `agent keys` refuses plain shells, validates every named key before sending any
 bytes, and queues a valid list as one ordered action. A closed target returns a
@@ -305,6 +313,16 @@ discovery rather than inferring support from an agent name.
   `luvus integration install opencode` adds a TUI-local plugin that reports
   only the root session selected in that pane plus structured usage. Without
   it, Mission Control leaves OpenCode usage unavailable instead of guessing.
+- OpenCode 2 Preview is detected separately as `opencode2`. Luvus can launch it
+  and resume an exact known ID with `opencode2 --session <id>`, but does not
+  scan its live SQLite database or reuse the OpenCode V1 integration. Its
+  reviewed unattended command, `opencode2 run --auto`, is available only for
+  an explicit `full_access` automation.
+- Kilo Code is detected through the official `kilo` and `kilocode` commands.
+  Resume and fork use Kilo's native commands only when Luvus already has the
+  exact session ID; Luvus does not scan or guess sessions from Kilo's database.
+  A scheduled Kilo worker requires the user's explicit `full_access` selection
+  because its reviewed unattended command is `kilo run --auto`.
 - `luvus integration install hermes` adds exact per-pane session ownership for
   restart resume. Hermes detection still works without it, but Luvus does not
   scan Hermes's private history database or guess a session.
@@ -390,7 +408,18 @@ read-only and control access both default to 24 hours. `--no-expiry` binds the
 client token to the foreground access process and keeps it valid until that
 process closes.
 
+Control Access permits `agent.keys` for recognized agent panes with the local
+key grammar, including `ctrl+z`, printable Unicode and `["esc","[","Z"]`.
+Read-only Access denies it. A rejected batch queues no prefix; success returns
+the resolved `pane` and means queued, not consumed. This does not authorize
+`agent.send`, raw pane input, launch, fork, or close through the gateway.
+
 ## Remote use
+
+Observe/control `terminal.frame` messages replace the previous capture at the
+frame's own `content_revision`. The acknowledgment revision is not an emitted
+frame cursor. A quiet final update must remain deliverable after an in-flight
+write; reconnect for a fresh frame after EOF or `terminal.resync_required`.
 
 ```sh
 ssh <host>             # run Luvus on that machine
@@ -401,6 +430,15 @@ Both require Luvus on the remote machine. `--remote` uses the user's existing
 SSH transport. It does not create a Luvus network daemon. For diagnosis,
 identify the server host, selected session, remote binary, noninteractive PATH,
 and inherited endpoint.
+
+After pairing through Access, `uhp.capabilities` retains owner `methods` and
+adds `access.mode`, `access.allowed_methods`, and gateway-specific
+`access.limits.connections` / `requests_per_minute`. Intersect the allowed set
+with server methods and your supported actions. Owner endpoints omit `access`;
+older gateways may omit it too, which never proves write permission. Control
+includes keys and existing automation writes, but excludes standalone terminal
+input and token administration. Re-discover after reconnect; accept unknown
+additive fields. No owner socket/token or new event is exposed.
 
 ## Troubleshooting order
 
@@ -455,3 +493,20 @@ newer release.
 
 When the website and installed binary disagree, follow the installed binary and
 tell the human about the version difference.
+
+## Prompt wait observation
+
+With `--wait`, `agent prompt` (also `agent send`) requires a new `working` or
+`blocked` transition before the requested `--until` state can complete the wait.
+An unchanged status, title flicker, or quiet output alone cannot complete it.
+`observed_state` records the first active transition; `status` is the current state.
+The absolute `--timeout` covers both stages (default 300 seconds). Timeout returns
+`matched:false`, `evidence:"timeout"`, and a null `observed_state` if no transition
+was seen. Pane or terminal exit returns `agent_not_running` with `pane`, `queued`,
+`submitted`, `observed_state`, `reason:"pane_closed"`, `baseline_revision`, and
+`content_revision` under `error.data`. Timeout and pane exit during a wait use CLI
+exit code 2. Cancellation, timeout, and exit release pending wait ownership.
+Without `--wait`, the immediate `submitted:true`, `evidence:"queued"` response is
+unchanged and omits `observed_state`. Submission still means queue admission;
+state transitions do not confirm consumption of the prompt text. Do not resend
+automatically after a timeout or lost response because queued input may execute.

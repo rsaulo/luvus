@@ -90,6 +90,13 @@ impl HostGraphics {
         self.0.pending.store(true, Ordering::Release);
     }
 
+    /// Non-consuming fence for a projection made after the last collection.
+    /// Only the app thread consumes the flag; producers set it before their
+    /// changed graphics/grid can be observed outside the engine lock.
+    pub(crate) fn pending(&self) -> bool {
+        self.0.pending.load(Ordering::Acquire)
+    }
+
     /// Whether any pane may be holding commands, clearing the flag so a
     /// command queued during the collection that follows is not missed.
     ///
@@ -952,10 +959,8 @@ impl ControlData {
             if pair.is_empty() {
                 continue;
             }
-            let (key, value) = match pair.iter().position(|byte| *byte == b'=') {
-                Some(split) => (&pair[..split], &pair[split + 1..]),
-                None => return None,
-            };
+            let split = pair.iter().position(|byte| *byte == b'=')?;
+            let (key, value) = (&pair[..split], &pair[split + 1..]);
             // Every key in the protocol is a single character.
             let [key] = key else {
                 return None;
@@ -1100,6 +1105,8 @@ mod tests {
     fn malformed_control_data_is_never_answered() {
         for payload in [
             "a",                    // no value
+            "a=q,i",                // missing separator after a valid pair
+            "a=q,=9",               // empty key
             "aa=q",                 // multi-character key
             "a=q,i=99999999999999", // id beyond the protocol's range
             "a=q,i=-1",             // negative where unsigned is required
@@ -1107,6 +1114,11 @@ mod tests {
             "a=q,i=12x",            // trailing garbage
         ] {
             assert_eq!(reply(payload), None, "must not answer {payload:?}");
+            assert_eq!(
+                reply_when_supported(payload),
+                None,
+                "must not answer {payload:?}"
+            );
         }
     }
 
@@ -1506,9 +1518,16 @@ mod tests {
     #[test]
     fn pending_is_cleared_before_collection_so_a_racing_command_is_not_lost() {
         let graphics = HostGraphics::default();
+        assert!(!graphics.pending());
         assert!(!graphics.take_pending(), "nothing queued yet");
         graphics.mark_pending();
+        assert!(graphics.pending());
+        assert!(
+            graphics.pending(),
+            "checking a projection must not consume the flag"
+        );
         assert!(graphics.take_pending());
+        assert!(!graphics.pending());
         assert!(!graphics.take_pending(), "the flag is consumed");
     }
 

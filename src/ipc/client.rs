@@ -8,11 +8,11 @@ use std::thread;
 use anyhow::{anyhow, Result};
 use ratatui::backend::Backend;
 use ratatui::buffer::Cell;
-#[cfg(windows)]
-use ratatui::crossterm::event::poll as poll_event;
+#[cfg(not(windows))]
+use ratatui::crossterm::event::read as read_event;
 use ratatui::crossterm::event::{
-    read as read_event, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture,
-    EnableBracketedPaste, EnableFocusChange, EnableMouseCapture, Event,
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event,
 };
 use ratatui::crossterm::execute;
 use ratatui::layout::Position;
@@ -225,6 +225,8 @@ where
         EnableFocusChange,
         crossterm::terminal::SetTitle(crate::window_title())
     );
+    #[cfg(windows)]
+    let _windows_input_mode = crate::terminal::host_input::enable_input_mode();
     // Let the terminal report Shift+Enter et al. as distinct keys, so agents get
     // a real "new line" key instead of a bare CR (see `push_key_protocol`).
     crate::push_key_protocol();
@@ -364,32 +366,9 @@ fn switched_args(raw: &[String], name: &str) -> Vec<String> {
 fn input_loop<W: Write>(mut writer: W, pending: Vec<Event>) {
     #[cfg(windows)]
     {
-        let mut decoder = crate::terminal::host_input::HostInputDecoder::default();
-        for event in pending {
-            if !write_decoded_input(&mut writer, decoder.push(event)) {
-                return;
-            }
-        }
-        loop {
-            if let Some(timeout) = decoder.wait_timeout() {
-                match poll_event(timeout) {
-                    Ok(false) => {
-                        if !write_decoded_input(&mut writer, decoder.flush_expired()) {
-                            break;
-                        }
-                        continue;
-                    }
-                    Ok(true) => {}
-                    Err(_) => break,
-                }
-            }
-            let Ok(event) = read_event() else {
-                break;
-            };
-            if !write_decoded_input(&mut writer, decoder.push(event)) {
-                break;
-            }
-        }
+        crate::terminal::host_input::run_input_loop(pending, |event| {
+            write_input_event(&mut writer, event)
+        });
     }
 
     #[cfg(not(windows))]
@@ -411,22 +390,18 @@ fn write_input_event(writer: &mut impl Write, event: Event) -> bool {
     event_message(event).is_none_or(|message| protocol::write_message(writer, &message).is_ok())
 }
 
-#[cfg(windows)]
-fn write_decoded_input(
-    writer: &mut impl Write,
-    decoded: crate::terminal::host_input::DecodedEvents,
-) -> bool {
-    let mut connected = true;
-    decoded.for_each(|event| {
-        if connected {
-            connected = write_input_event(writer, event);
-        }
-    });
-    connected
+fn event_message(event: Event) -> Option<ClientMessage> {
+    event_message_with_image(event, crate::platform::clipboard_image)
 }
 
-fn event_message(event: Event) -> Option<ClientMessage> {
+fn event_message_with_image(
+    event: Event,
+    image: impl FnOnce() -> Option<Vec<u8>>,
+) -> Option<ClientMessage> {
     match crate::terminal::host_key::normalize_platform_modifiers(event) {
+        Event::Key(k) if crate::clipboard_image::is_image_paste_key(&k) => image()
+            .map(ClientMessage::ClipboardImage)
+            .or(Some(ClientMessage::Key(k))),
         Event::Key(k) => Some(ClientMessage::Key(k)),
         Event::Mouse(m) => Some(ClientMessage::Mouse(m)),
         Event::Resize(cols, rows) => {
@@ -1068,6 +1043,22 @@ mod render_tests {
         assert!(matches!(
             message,
             Some(ClientMessage::Paste(text)) if text == command
+        ));
+    }
+
+    #[test]
+    fn image_paste_chord_uses_binary_data_and_falls_back_to_the_key() {
+        let key = ratatui::crossterm::event::KeyEvent::new(
+            ratatui::crossterm::event::KeyCode::Char('v'),
+            ratatui::crossterm::event::KeyModifiers::CONTROL,
+        );
+        assert!(matches!(
+            event_message_with_image(Event::Key(key), || Some(vec![1, 2, 3])),
+            Some(ClientMessage::ClipboardImage(bytes)) if bytes == [1, 2, 3]
+        ));
+        assert!(matches!(
+            event_message_with_image(Event::Key(key), || None),
+            Some(ClientMessage::Key(fallback)) if fallback == key
         ));
     }
 

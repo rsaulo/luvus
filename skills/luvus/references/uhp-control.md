@@ -39,6 +39,22 @@ The client pairs once, then uses the returned token on ordinary UHP frames.
 Keep the loopback endpoint private and require an encrypted, authenticated
 transport.
 
+Control Access permits `agent.keys` for recognized agent panes; read-only
+Access denies it. The RPC retains local key grammar, including `ctrl+z`,
+printable Unicode, and `["esc","[","Z"]` for Shift+Tab, which is wider than
+control-stream `send_key`. Invalid batches queue no prefix. Success identifies
+the resolved `pane` and means queued, not consumed. Inspect before answering;
+do not infer permission for `agent.send`, raw pane input, launch, fork, or close.
+
+After pairing through Access, `uhp.capabilities` retains owner `methods` and
+adds `access.mode`, `access.allowed_methods`, and gateway-specific
+`access.limits.connections` / `requests_per_minute`. Intersect the allowed set
+with server methods and your supported actions. Owner endpoints omit `access`;
+older gateways may omit it too, which never proves write permission. Control
+includes keys and existing automation writes, but excludes standalone terminal
+input and token administration. Re-discover after reconnect; accept unknown
+additive fields. No owner socket/token or new event is exposed.
+
 ## Bootstrap and maintain state
 
 Use this order for a stateful harness:
@@ -78,6 +94,9 @@ read current state and reconcile instead of blindly retrying.
     `full_access`; omitted access defaults to `workspace`. This is independent
     of `task.mode`. Never retry an unsupported agent/access pair with broader
     access unless the user explicitly selected it.
+  - Kilo Code new-worker schedules support only an explicitly selected
+    `full_access` profile because its reviewed unattended command is
+    `kilo run --auto`. Never broaden a Kilo schedule automatically.
   - `target` defaults to `new_worker`. Use `active_agent` only with the exact
     live `pane_id`, `terminal_id`, `task.agent_id`, and `task.workspace_id`
     returned by discovery. Its `if_busy` policy is `wait` or `skip`; it creates
@@ -127,6 +146,9 @@ required and authorized.
 - Handle `terminal.frame`, `terminal.output_ready`, exit, close, and resync
   events by their exact terminal ID and sequence.
 - Treat the control stream as an exclusive lease and release it promptly.
+- Apply `terminal.frame` as a complete replacement at its captured revision;
+  the acknowledgment revision is not an emitted-frame cursor. Reconnect for a
+  fresh frame after EOF or resync, including when the child is quiet.
 - Use typed literal, submit, and key actions instead of inventing escape
   sequences.
 - Never replace semantic agent or pane commands with terminal control merely
@@ -143,3 +165,28 @@ not prove a mutation failed. After a lost or uncertain response, inspect live
 state before retrying because input, prompts, starts, and closes can execute
 twice. Retry read-only idempotent methods when appropriate; reconcile every
 write against current revisions and identities first.
+
+### Prompt wait observation
+
+With `wait:true`, `agent prompt` (also `agent send`) requires a new `working` or
+`blocked` transition before the requested `until` state can complete the wait.
+An unchanged status, title flicker, or quiet output alone cannot complete it.
+`observed_state` records the first active transition; `status` is the current state.
+The absolute `timeout_s` covers both stages (default 300 seconds). Timeout returns
+`matched:false`, `evidence:"timeout"`, and a null `observed_state` if no transition
+was seen. Pane or terminal exit returns `agent_not_running` with `pane`, `queued`,
+`submitted`, `observed_state`, `reason:"pane_closed"`, `baseline_revision`, and
+`content_revision` under `error.data`. Timeout and pane exit during a wait use CLI
+exit code 2. Cancellation, timeout, and exit release pending wait ownership.
+Without `wait:true`, the immediate `submitted:true`, `evidence:"queued"` response is
+unchanged and omits `observed_state`. Submission still means queue admission;
+state transitions do not confirm consumption of the prompt text. Do not resend
+automatically after a timeout or lost response because queued input may execute.
+For `agent.send` and `agent.prompt`, detected blocked prompt evidence—including
+in non-Codex panes—returns `agent_not_ready` before text or Enter is queued.
+Startup, sign-in, selection, and approval screens are examples, not an
+exhaustive list. A server-launched or restored Codex pane with an `agent_session`
+also returns `agent_not_ready` when prompt evidence is Unknown, unless live Codex
+composer geometry reports Ready. Existing Codex panes without that requirement
+retain the permissive Unknown-evidence fallback. Inspect the visible screen and
+use `agent.keys` only for an explicitly authorized interaction.

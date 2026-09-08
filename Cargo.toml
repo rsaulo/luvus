@@ -61,7 +61,7 @@ unicode-width = "0.2"
 # runs after the user chooses a Markdown/Mermaid preview action.
 pulldown-cmark = { version = "0.13", default-features = false }
 anyhow = "1"
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 # `preserve_order` keeps a user's key order intact when an integration edits
 # their config: a round-trip through the default sorted map would silently
 # rewrite an unrelated file top to bottom.
@@ -117,7 +117,9 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Console",
+    "Win32_System_DataExchange",
     "Win32_System_Kernel",
+    "Win32_System_Memory",
     "Win32_System_Threading",
 ] }
 

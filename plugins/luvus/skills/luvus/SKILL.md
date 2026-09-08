@@ -239,6 +239,29 @@ luvus agent send reviewer "Review the diff. When done, run: luvus agent send lea
 After a no-wait handoff, end the turn. The report-back message starts a fresh
 turn. An external terminal has no caller pane, so do not invent one.
 
+With `--wait`, `agent prompt` (also `agent send`) requires a new `working` or
+`blocked` transition before the requested `--until` state can complete the wait.
+An unchanged status, title flicker, or quiet output alone cannot complete it.
+`observed_state` records the first active transition; `status` is the current state.
+The absolute `--timeout` covers both stages (default 300 seconds). Timeout returns
+`matched:false`, `evidence:"timeout"`, and a null `observed_state` if no transition
+was seen. Pane or terminal exit returns `agent_not_running` with `pane`, `queued`,
+`submitted`, `observed_state`, `reason:"pane_closed"`, `baseline_revision`, and
+`content_revision` under `error.data`. Timeout and pane exit during a wait use CLI
+exit code 2. Cancellation, timeout, and exit release pending wait ownership.
+Without `--wait`, the immediate `submitted:true`, `evidence:"queued"` response is
+unchanged and omits `observed_state`. Submission still means queue admission;
+state transitions do not confirm consumption of the prompt text. Do not resend
+automatically after a timeout or lost response because queued input may execute.
+For `agent.send` and `agent.prompt`, detected blocked prompt evidence—including
+in non-Codex panes—returns `agent_not_ready` and queues no input. Startup,
+sign-in, selection, and approval screens are examples, not an exhaustive list.
+A server-launched or restored Codex pane with an `agent_session` also returns
+`agent_not_ready` when prompt evidence is Unknown, unless live Codex composer
+geometry reports Ready. Existing Codex panes without that requirement retain the
+permissive Unknown-evidence fallback. Read the visible screen before deciding
+whether an explicit `agent keys` action is authorized.
+
 When waiting was requested, keep it bounded and read a bounded result:
 
 ```sh
@@ -317,7 +340,7 @@ luvus agent get <target>
 luvus agent fork <target> [--name <alias>] [--no-focus]
 ```
 
-Native forks currently support Claude, Grok, Codex, Pi, and OMP. Report
+Native forks currently support Claude, Grok, Codex, Kilo Code, Pi, and OMP. Report
 `unsupported_agent`, `session_unknown`, or `spawn_failed` exactly when returned.
 Do not approximate a failed fork with `pane split`, `agent start`, or `resume`,
 because those paths do not guarantee an independent copy of the conversation.
@@ -432,6 +455,8 @@ surface:
   detection remains authoritative for agent state.
 - For OpenCode, `luvus integration install opencode` adds exact TUI-local root
   session ownership and structured usage. Without it, usage stays unavailable.
+- OpenCode 2 Preview is a separate `opencode2` agent. Do not install the
+  OpenCode V1 integration for it or infer session IDs from its live database.
 - For Hermes, `luvus integration install hermes` adds exact per-pane session
   ownership for restart resume. Detection remains native, but Luvus does not
   scan Hermes's private history store.

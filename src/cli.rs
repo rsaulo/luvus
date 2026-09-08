@@ -146,7 +146,7 @@ panes / agents:
   pane focus <id>            focus a pane (jumps to its workspace/tab)
   pane move [<id>] (--tab <n> | --new-tab)  move a pane within its workspace
   pane run [<id>] <cmd...>   run a command in a pane
-  pane send [<id>] <text>    send raw text to a pane
+  pane send [<id>] <text>    paste text into a pane
   pane read [<id>]           print a pane's recent output
   pane status [<id>]         print a pane's agent status and history metrics (any workspace)
   pane processes [<id>]      list cached executable identities without exposing arguments
@@ -2201,13 +2201,17 @@ fn agent_send_cmd(args: &[String]) -> Result<i32> {
         "{}",
         serde_json::to_string_pretty(&response).unwrap_or_default()
     );
-    Ok(if !ok {
-        1
-    } else if wait && !matched {
-        2
-    } else {
-        0
-    })
+    Ok(
+        if wait && response["error"]["code"] == "agent_not_running" {
+            2
+        } else if !ok {
+            1
+        } else if wait && !matched {
+            2
+        } else {
+            0
+        },
+    )
 }
 
 fn pane_status_from_response(response: &Value) -> Result<Option<&str>> {
@@ -3236,6 +3240,7 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
             let text = tail().join(" ");
             let mut obj = serde_json::Map::new();
             obj.insert("text".to_string(), json!(text));
+            obj.insert("paste".to_string(), json!(true));
             ("pane.send_input".into(), with_pane(obj))
         }
         ("pane", "read") => ("pane.read".into(), with_pane(serde_json::Map::new())),
@@ -4466,6 +4471,28 @@ mod tests {
     }
 
     #[test]
+    fn pane_send_requests_atomic_paste_semantics() {
+        let (method, params) = parse(&argv("luvus pane send 9 first second")).unwrap();
+        assert_eq!(method, "pane.send_input");
+        assert_eq!(params.get("pane").and_then(Value::as_str), Some("9"));
+        assert_eq!(
+            params.get("text").and_then(Value::as_str),
+            Some("first second")
+        );
+        assert_eq!(params.get("paste").and_then(Value::as_bool), Some(true));
+
+        let args = ["luvus", "pane", "send", "9", "first\nsecond"]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>();
+        let (_, params) = parse(&args).unwrap();
+        assert_eq!(
+            params.get("text").and_then(Value::as_str),
+            Some("first\nsecond")
+        );
+    }
+
+    #[test]
     fn uhp_is_the_single_public_protocol_cli_route() {
         assert!(is_cli(&argv("luvus uhp capabilities")));
         assert_eq!(
@@ -5362,6 +5389,60 @@ mod tests {
             .expect("read wait request");
         let request = serde_json::from_str(&line).expect("parse wait request");
         (connection, request)
+    }
+
+    #[test]
+    fn observed_prompt_cli_preserves_invocations_and_exit_codes() {
+        let _env = crate::persist::test_env("p-cli");
+        let listener = wait_test_server();
+        let cases = [
+            ("luvus agent prompt 7 review", json!({"target":"7","text":"review","wait":false})),
+            ("luvus agent send reviewer review this", json!({"target":"reviewer","text":"review this","wait":false})),
+            ("luvus agent prompt codex review --wait", json!({"target":"codex","text":"review","wait":true})),
+            ("luvus agent send 7 review --wait --until done --timeout 0.5", json!({"target":"7","text":"review","wait":true,"until":["done"],"timeout_s":0.5})),
+            ("luvus agent prompt 7 --wait --until idle --until working --until blocked --until done review --timeout 3600", json!({"target":"7","text":"review","wait":true,"until":["idle","working","blocked","done"],"timeout_s":3600.0})),
+            ("luvus agent send 7 --wait --until idle --until idle --timeout 0 review", json!({"target":"7","text":"review","wait":true,"until":["idle","idle"],"timeout_s":0.0})),
+            ("luvus agent prompt 7 -- --wait literal", json!({"target":"7","text":"--wait literal","wait":false})),
+        ];
+        let expected: Vec<Value> = cases.iter().map(|(_, params)| params.clone()).collect();
+        let server = std::thread::spawn(move || {
+            for params in expected {
+                let (mut connection, request) = accept_wait_request(&listener);
+                assert_eq!(request["method"], "agent.prompt");
+                assert_eq!(request["params"], params);
+                writeln!(
+                    connection,
+                    "{}",
+                    json!({"id":"1","result":{"submitted":true,"matched":true}})
+                )
+                .unwrap();
+            }
+            for response in [
+                json!({"result":{"submitted":true,"matched":false}}),
+                json!({"error":{"code":"send_failed","message":"queue closed"}}),
+                json!({"error":{"code":"agent_not_running","message":"exited"}}),
+                json!({"error":{"code":"agent_not_running","message":"exited"}}),
+            ] {
+                let (mut connection, _) = accept_wait_request(&listener);
+                writeln!(connection, "{response}").unwrap();
+            }
+        });
+        for (invocation, _) in cases {
+            assert_eq!(
+                agent_send_cmd(&argv(invocation)).unwrap(),
+                0,
+                "{invocation}"
+            );
+        }
+        for (wait, exit) in [(true, 2), (true, 1), (true, 2), (false, 1)] {
+            let invocation = if wait {
+                "luvus agent prompt 7 review --wait"
+            } else {
+                "luvus agent prompt 7 review"
+            };
+            assert_eq!(agent_send_cmd(&argv(invocation)).unwrap(), exit);
+        }
+        server.join().unwrap();
     }
 
     #[test]
