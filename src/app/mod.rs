@@ -10231,6 +10231,129 @@ mod tests {
         assert!(!app.agent_usage.contains_key(&key));
     }
 
+    /// `pane.release_session` is how an integration gives a reported binding
+    /// back when its agent leaves that session. It is fenced by identity, so a
+    /// release delayed behind a newer report -- a retry on a slow socket, a
+    /// late navigation event -- can never clear the session the user is in
+    /// now. Once a release does apply, the binding must not come back through
+    /// a snapshot either.
+    #[test]
+    fn released_session_is_identity_fenced_and_never_restored() {
+        let _env = crate::persist::test_env("released-session-fence");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.run_cmd(crate::app::keys::Cmd::SplitRight);
+        let panes = app.layout().leaves();
+        let owner = panes[0];
+        let other = panes[1];
+        let report = |pane: PaneId, session: &str, updated_at: u64| {
+            json!({
+                "pane": pane.0.to_string(),
+                "agent": "opencode",
+                "session_id": session,
+                "usage": {
+                    "model": "openai/gpt-5",
+                    "tokens_in": 10,
+                    "tokens_out": 5,
+                    "cache_read": 2,
+                    "cache_write": 1,
+                    "cost": 0.01,
+                    "updated_at": updated_at
+                }
+            })
+        };
+        let release = |pane: PaneId, agent: &str, session: &str| json!({"pane": pane.0.to_string(), "agent": agent, "session_id": session});
+        let bound = |app: &App, pane: PaneId| {
+            app.status[&pane]
+                .agent_session
+                .as_ref()
+                .map(|session| session.session_id.clone())
+        };
+
+        assert_eq!(
+            api_call(&mut app, "pane.report_session", report(owner, "ses_a", 100))["result"]
+                ["type"],
+            "ok"
+        );
+
+        // Nothing but the exact `{pane, agent, session_id}` triple releases it.
+        for mismatch in [
+            release(owner, "claude", "ses_a"),
+            release(owner, "opencode", "ses_b"),
+            release(other, "opencode", "ses_a"),
+        ] {
+            let response = api_call(&mut app, "pane.release_session", mismatch);
+            assert_eq!(response["result"]["type"], "ok");
+            assert_eq!(response["result"]["released"], false);
+            assert_eq!(bound(&app, owner).as_deref(), Some("ses_a"));
+        }
+
+        // The user moves on to a newer session, and the release for the old one
+        // only now reaches the server. It must not clear the newer binding.
+        assert_eq!(
+            api_call(&mut app, "pane.report_session", report(owner, "ses_b", 200))["result"]
+                ["type"],
+            "ok"
+        );
+        let stale = api_call(
+            &mut app,
+            "pane.release_session",
+            release(owner, "opencode", "ses_a"),
+        );
+        assert_eq!(stale["result"]["released"], false);
+        assert_eq!(bound(&app, owner).as_deref(), Some("ses_b"));
+
+        // The matching release clears the binding and the usage it owned.
+        let key = crate::mission::UsageKey::new("opencode", "ses_b");
+        assert!(app.reported_usage.contains_key(&key));
+        let released = api_call(
+            &mut app,
+            "pane.release_session",
+            release(owner, "opencode", "ses_b"),
+        );
+        assert_eq!(released["result"]["released"], true);
+        assert_eq!(bound(&app, owner), None);
+        assert!(!app.reported_usage.contains_key(&key));
+        assert!(!app.agent_usage.contains_key(&key));
+
+        // A second release is a harmless no-op, and the freed session can be
+        // claimed by a different pane.
+        let again = api_call(
+            &mut app,
+            "pane.release_session",
+            release(owner, "opencode", "ses_b"),
+        );
+        assert_eq!(again["result"]["released"], false);
+        assert_eq!(
+            api_call(&mut app, "pane.report_session", report(other, "ses_b", 300))["result"]
+                ["type"],
+            "ok"
+        );
+        assert_eq!(bound(&app, other).as_deref(), Some("ses_b"));
+        assert_eq!(
+            api_call(
+                &mut app,
+                "pane.release_session",
+                release(other, "opencode", "ses_b")
+            )["result"]["released"],
+            true
+        );
+
+        // Persistence follows ownership: a snapshot taken after the release
+        // restores no session at all.
+        let json = serde_json::to_string(&persist::snapshot(&app)).unwrap();
+        let snapshot: SessionSnapshot = serde_json::from_str(&json).unwrap();
+        let (tx2, _rx2) = mpsc::channel();
+        let restored = App::from_snapshot(snapshot, tx2).expect("restore");
+        assert!(
+            restored
+                .status
+                .values()
+                .all(|status| status.agent_session.is_none()),
+            "a released session never comes back through a snapshot"
+        );
+    }
+
     #[test]
     fn reported_usage_uses_the_same_pricing_override_as_native_usage() {
         let _env = crate::persist::test_env("reported-session-pricing");

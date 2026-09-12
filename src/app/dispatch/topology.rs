@@ -435,6 +435,59 @@ impl App {
         }
     }
 
+    // The other half of `pane.report_session`: an integration gives an exact
+    // binding back when its agent leaves that session. The release is fenced by
+    // `{pane, agent, session_id}`, so a delayed release for an old session can
+    // never clear a newer one -- a mismatch is a no-op, not an error, because a
+    // late release racing a newer report is ordinary and harmless.
+    pub(super) fn api_pane_release_session(&mut self, method: &str, p: &Value) -> DispatchResult {
+        let _ = (method, p);
+        {
+            reject_api_fields(p, &["pane", "agent", "session_id"])?;
+            let id = self.resolve_pane(p)?.ok_or_else(not_found)?;
+            let raw_agent = required_bounded_string(p, "agent", 64)?;
+            let agent = crate::agent::canonical_builtin(&raw_agent).ok_or_else(|| {
+                (
+                    "invalid_request".to_string(),
+                    "agent must name a built-in Luvus adapter".to_string(),
+                )
+            })?;
+            let session_id = required_bounded_string(p, "session_id", 256)?;
+            if !crate::agent::safe_session_id(&session_id) {
+                return Err((
+                    "invalid_request".to_string(),
+                    "session_id must contain only safe identifier characters".to_string(),
+                ));
+            }
+
+            let status = self.status.get_mut(&id).ok_or_else(not_found)?;
+            let owned = status
+                .agent_session
+                .as_ref()
+                .is_some_and(|session| session.agent == agent && session.session_id == session_id);
+            if !owned {
+                return Ok(json!({"type":"ok", "released":false}));
+            }
+            status.agent_session = None;
+            status.force_detect = true;
+
+            // Usage this pane reported for the same session goes with it, so
+            // another pane can claim that conversation cleanly afterwards.
+            let key = crate::mission::UsageKey::new(agent, &session_id);
+            if self
+                .reported_usage
+                .get(&key)
+                .is_some_and(|owner| owner.pane == id)
+            {
+                self.reported_usage.remove(&key);
+                self.agent_usage.remove(&key);
+                self.usage_mtimes.remove(&key);
+            }
+            self.session_dirty = true;
+            Ok(json!({"type":"ok", "released":true}))
+        }
+    }
+
     // A precise agent lifecycle event from an integration hook:
     // permission prompt, question, turn end. Forwarded verbatim onto the
     // event bus as `agent.hook` for modules and API clients.

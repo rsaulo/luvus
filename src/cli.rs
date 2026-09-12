@@ -3382,6 +3382,18 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
             );
             ("pane.report_session".into(), with_pane(obj))
         }
+        ("pane", "release") => {
+            let mut obj = serde_json::Map::new();
+            obj.insert(
+                "agent".to_string(),
+                json!(flag(args, "--agent").unwrap_or_default()),
+            );
+            obj.insert(
+                "session_id".to_string(),
+                json!(flag(args, "--session").unwrap_or_default()),
+            );
+            ("pane.release_session".into(), with_pane(obj))
+        }
         ("pane", "report-event") => {
             let mut obj = serde_json::Map::new();
             obj.insert(
@@ -4578,6 +4590,34 @@ mod tests {
         ] {
             let args = argv(raw);
             assert_eq!(command_help_request(&args), None, "{raw}");
+        }
+    }
+
+    /// `pane report` and `pane release` are the two halves of one binding, so
+    /// they take the same identity and target the same pane.
+    #[test]
+    fn pane_report_and_release_carry_the_same_session_identity() {
+        for (raw, expected) in [
+            (
+                "luvus pane report 9 --agent opencode --session ses_123",
+                "pane.report_session",
+            ),
+            (
+                "luvus pane release 9 --agent opencode --session ses_123",
+                "pane.release_session",
+            ),
+        ] {
+            let (method, params) = parse(&argv(raw)).unwrap();
+            assert_eq!(method, expected);
+            assert_eq!(params.get("pane").and_then(Value::as_str), Some("9"));
+            assert_eq!(
+                params.get("agent").and_then(Value::as_str),
+                Some("opencode")
+            );
+            assert_eq!(
+                params.get("session_id").and_then(Value::as_str),
+                Some("ses_123")
+            );
         }
     }
 

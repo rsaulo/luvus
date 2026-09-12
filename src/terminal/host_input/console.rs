@@ -289,11 +289,11 @@ fn parse_win32_record(body: &str) -> Option<ConsoleKeyRecord> {
     fields.next().is_none().then_some(record)
 }
 
+// A zero scan code (or a zero virtual key) is what marks a synthesized console
+// record. An explicit escape clause here would be subsumed by `scan_code == 0`,
+// which current Clippy rejects as a logic bug.
 fn stream_record_candidate(record: ConsoleKeyRecord) -> bool {
-    record.key_down
-        && (record.virtual_key == 0
-            || record.scan_code == 0
-            || (record.utf16 == 0x1b && record.scan_code == 0 && record.control_state == 0))
+    record.key_down && (record.virtual_key == 0 || record.scan_code == 0)
 }
 
 fn record_for_char(ch: char) -> ConsoleKeyRecord {
@@ -320,7 +320,7 @@ fn raw_escape_candidate(record: ConsoleKeyRecord) -> bool {
     record.key_down
         && record.scan_code == 0
         && record.control_state == 0
-        && (record.utf16 == 0x1b || (record.virtual_key == VK_ESCAPE && record.scan_code == 0))
+        && (record.utf16 == 0x1b || record.virtual_key == VK_ESCAPE)
 }
 
 fn control_prefix(text: &str) -> bool {
@@ -793,6 +793,72 @@ mod tests {
                 && event.column == 2
                 && event.row == 3
                 && event.modifiers == KeyModifiers::CONTROL));
+    }
+
+    /// The clauses dropped from `stream_record_candidate` and
+    /// `raw_escape_candidate` were already implied by `scan_code == 0`, which
+    /// is why current Clippy rejects them as a logic bug. Pin that equivalence
+    /// across every escape-shaped record, including the zero-scan `VK_ESCAPE`
+    /// Windows Terminal sends, so the simplification can never drift into a
+    /// routing change.
+    // The longhand predicates below are deliberately redundant: they are the
+    // pre-simplification text, kept only as the comparison baseline.
+    #[allow(clippy::overly_complex_bool_expr, clippy::nonminimal_bool)]
+    #[test]
+    fn escape_record_classification_matches_the_longhand_predicates() {
+        let longhand_stream = |record: ConsoleKeyRecord| {
+            record.key_down
+                && (record.virtual_key == 0
+                    || record.scan_code == 0
+                    || (record.utf16 == 0x1b && record.scan_code == 0 && record.control_state == 0))
+        };
+        let longhand_raw = |record: ConsoleKeyRecord| {
+            record.key_down
+                && record.scan_code == 0
+                && record.control_state == 0
+                && (record.utf16 == 0x1b
+                    || (record.virtual_key == VK_ESCAPE && record.scan_code == 0))
+        };
+        for key_down in [true, false] {
+            for virtual_key in [0, VK_ESCAPE, 0x41] {
+                for scan_code in [0, 1] {
+                    for utf16 in [0, 0x1b, 0x41] {
+                        for control_state in [0, 8] {
+                            let record = ConsoleKeyRecord {
+                                key_down,
+                                repeat_count: 1,
+                                virtual_key,
+                                scan_code,
+                                utf16,
+                                control_state,
+                            };
+                            assert_eq!(
+                                stream_record_candidate(record),
+                                longhand_stream(record),
+                                "{record:?}"
+                            );
+                            assert_eq!(
+                                raw_escape_candidate(record),
+                                longhand_raw(record),
+                                "{record:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // The record this PR was accused of rerouting still takes the same path
+        // as before: the win32 framer accepts it, and it stays a raw-control
+        // escape candidate.
+        let zero_scan = ConsoleKeyRecord {
+            key_down: true,
+            repeat_count: 1,
+            virtual_key: VK_ESCAPE,
+            ..ConsoleKeyRecord::default()
+        };
+        assert!(stream_record_candidate(zero_scan));
+        assert!(raw_escape_candidate(zero_scan));
     }
 
     #[test]
