@@ -84,11 +84,11 @@ for an agent to receive it:
 `luvus skill enable` makes no network request. It installs the same bundled
 skill into detected native skill locations without overwriting external or
 modified content. The shared `~/.agents/skills/luvus/` copy serves Codex,
-GitHub Copilot CLI, Gemini CLI, Pi, Cursor, Amp, Droid, fx, and Kilo Code.
-Dedicated adapters serve Claude Code, OpenCode, OpenCode 2 Preview, Kimi Code
-CLI, Grok Build, Hermes CLI, Qwen Code, and Kiro. Aider has no native Agent
-Skills installation surface, so use `luvus skill show` when an Aider
-conversation needs the instructions.
+GitHub Copilot CLI, Gemini CLI, Pi, Cursor, Amp, Droid, fx, Kilo Code, and
+Devin. Dedicated adapters serve Claude Code, OpenCode, OpenCode 2 Preview,
+Kimi Code CLI, Grok Build, Hermes CLI, Qwen Code, and Kiro. Aider has no
+native Agent Skills installation surface, so use `luvus skill show` when an
+Aider conversation needs the instructions.
 
 Start a new agent conversation after installation, or use that agent's skill
 reload command when it provides one. To remove unchanged Luvus-managed copies:
@@ -251,6 +251,10 @@ Target a named session without attaching its TUI:
 luvus --session <name> pane list
 ```
 
+Each named session owns an independent workspace tree and saved-machine
+catalog. A session switch must not copy workspaces or machine profiles from the
+previous session.
+
 ## Panes and agents
 
 Discover the exact target first:
@@ -293,6 +297,26 @@ without that requirement retain the permissive Unknown-evidence fallback.
 bytes, and queues a valid list as one ordered action. A closed target returns a
 structured `send_failed` error.
 
+For UHP interactions that must match the inspected screen, use `agent.read`
+with `source:"visible"` and pass its `content_revision` as `if_content_revision`
+together with its `terminal_id` in `agent.keys` params. The revision is a
+non-negative integer; the terminal ID is exactly 32 lowercase hex characters.
+Both fields are optional as a pair; a one-sided or malformed pair is
+`invalid_request`. A deferred pane has `terminal_id:null` and cannot be fenced.
+An unavailable read snapshot has empty text and null coordinates.
+
+The server checks the pair and queues keys under the same engine lock used to
+capture the text. `content_revision_conflict` means no keys were queued: re-read
+and reassess the authorized action, never retry the same pair. Generic response
+`revision` / request `if_revision` are global event coordinates, not the pane's
+content counter. Without the pair, behavior is unchanged. Older servers omit the
+coordinates or reject the new fields; omit the pair only when legacy unfenced
+admission is acceptable. These are UHP params, not CLI flags.
+
+The fence covers queue admission only. Already queued input and child-side
+changes not yet observed remain outside it. Cursor/SGR output can make a pair
+stale even if the dialog text looks unchanged.
+
 Identity, live state, lifecycle hooks, usage, native resume, and fork support
 are separate capabilities. An agent can be detected without supporting every
 other capability. Use `agent explain`, the supported-agent reference, and UHP
@@ -309,10 +333,10 @@ discovery rather than inferring support from an agent name.
   `luvus integration install antigravity` hook reports only the exact
   conversation id needed for `agy --conversation <id>` restore; screen
   detection remains authoritative for state.
-- OpenCode detection and legacy JSON session discovery work without setup.
-  `luvus integration install opencode` adds a TUI-local plugin that reports
-  only the root session selected in that pane plus structured usage. Without
-  it, Mission Control leaves OpenCode usage unavailable instead of guessing.
+- Official `opencode` is V2.0.2+. This personal build reads structured SQLite
+  discovery and usage offline. `luvus integration install opencode` adds a
+  CLI-local root-session ownership plugin through `cli.json`. Its
+  `opencode run --auto` automation requires explicit `full_access`.
 - OpenCode 2 Preview is detected separately as `opencode2`. Luvus can launch it
   and resume an exact known ID with `opencode2 --session <id>`, but does not
   scan its live SQLite database or reuse the OpenCode V1 integration. Its
@@ -420,6 +444,10 @@ Read-only Access denies it. A rejected batch queues no prefix; success returns
 the resolved `pane` and means queued, not consumed. This does not authorize
 `agent.send`, raw pane input, launch, fork, or close through the gateway.
 
+Control also permits `pane.rename` with the existing `pane` and `name` parameters;
+read-only Access denies it. Rename retains the owner name validation and
+`pane.renamed` event. An empty name clears the pane alias.
+
 ## Remote use
 
 Observe/control `terminal.frame` messages replace the previous capture at the
@@ -430,19 +458,27 @@ write; reconnect for a fresh frame after EOF or `terminal.resync_required`.
 ```sh
 ssh <host>             # run Luvus on that machine
 luvus --remote <host>  # local thin client, remote Luvus server
+luvus machine list     # inspect saved SSH machines
 ```
 
-Both require Luvus on the remote machine. `--remote` uses the user's existing
-SSH transport. It does not create a Luvus network daemon. For diagnosis,
-identify the server host, selected session, remote binary, noninteractive PATH,
-and inherited endpoint.
+`--remote` requires Luvus on the remote machine and uses the user's existing
+SSH transport. Saved-machine onboarding can install a compatible user-local
+binary only after explicit foreground approval. `machine status` and background
+reconnects never install, update, or start a server. Neither mode creates a
+Luvus network daemon. For diagnosis, identify the server host, selected session,
+verified remote binary, noninteractive PATH, and inherited endpoint.
+
+In the saved-machine TUI, the header session control always owns the local
+named-session namespace. It remains local while remote workspace content is
+active and never rewrites the machine's configured remote session. Switching
+that local session reloads its independent workspace tree and machine catalog.
 
 After pairing through Access, `uhp.capabilities` retains owner `methods` and
 adds `access.mode`, `access.allowed_methods`, and gateway-specific
 `access.limits.connections` / `requests_per_minute`. Intersect the allowed set
 with server methods and your supported actions. Owner endpoints omit `access`;
 older gateways may omit it too, which never proves write permission. Control
-includes keys and existing automation writes, but excludes standalone terminal
+includes `pane.rename`, keys, and existing automation writes, but excludes standalone terminal
 input and token administration. Re-discover after reconnect; accept unknown
 additive fields. No owner socket/token or new event is exposed.
 

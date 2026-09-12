@@ -9,7 +9,7 @@ description: What luvus supports per agent, covering live status, session resume
 | GitHub Copilot CLI | ✓ | ✓ | no | ✓ |
 | Codex | ✓ | ✓ | ✓ | ✓ |
 | Antigravity CLI (`agy`) | ✓ | ✓ | no | session only |
-| opencode | ✓ | ✓ | no | ✓ |
+| OpenCode (`opencode`, V2.0.2+) | ✓ | ✓ | no | session only |
 | OpenCode 2 Preview (`opencode2`) | ✓ | with exact session ID | no | no |
 | Kimi Code CLI | ✓ | ✓ | no | ✓ |
 | Grok Build | ✓ | ✓ | ✓ | ✓ |
@@ -20,6 +20,7 @@ description: What luvus supports per agent, covering live status, session resume
 | fx | ✓ | ✓ | no | no |
 | Cursor | ✓ | resume command | no | no |
 | Kilo Code | ✓ | with exact session ID | with exact session ID | no |
+| Devin | ✓ | with exact session ID | no | no |
 | Gemini | ✓ | no | no | no |
 | Aider | ✓ | no | no | no |
 | Amp | ✓ | no | no | no |
@@ -65,22 +66,22 @@ description: What luvus supports per agent, covering live status, session resume
   remains responsible for idle/working/blocked state, and uninstall preserves
   every other named hook.
 
-  OpenCode installs `~/.config/opencode/luvus-tui.mjs`, or the equivalent under
-  `XDG_CONFIG_HOME`, and adds only that file to the TUI plugin list. The plugin
-  binds the root session selected by that specific TUI and reports its
-  structured usage over the inherited local Luvus endpoint. Background and
-  child-session events cannot claim the pane. Without the integration,
-  OpenCode detection and legacy JSON session discovery still work while usage
-  remains unavailable.
+  Since V2.0.2, the official `opencode` command runs V2. This personal build
+  installs its CLI-only integration under `~/.config/opencode/luvus-v2/` and
+  adds `./luvus-v2` to `cli.json`'s `plugins` array (respecting `XDG_CONFIG_HOME`).
+  The plugin reports the root session selected by that TUI. Native screen
+  detection remains authoritative for agent state. Discovery and usage read
+  bounded structured records from the local SQLite store, including
+  `session_v2`, without modifying it or starting the OpenCode service.
+  An explicit `OPENCODE_TUI_CONFIG` selects the legacy V1 installer.
 
-  OpenCode 2 Preview is a separate built-in agent because its `opencode2`
-  executable can run beside OpenCode V1 and uses a different service, database,
-  plugin, and permission contract. Luvus detects and launches it natively and
+  The compatibility command `opencode2` retains its separate Luvus identifier
+  for previously saved panes. Luvus detects and launches it natively and
   can resume `opencode2 --session <id>` when an exact session ID is already
   known. Luvus does not open its live SQLite database, start its service for
   background discovery, reuse the V1 integration, or claim native TUI forking.
-  Scheduled OpenCode 2 workers require explicit **Full access**, mapped to its
-  documented `opencode2 run --auto` command.
+  Scheduled workers for both commands require explicit **Full access**, mapped
+  to `opencode run --auto` or `opencode2 run --auto`.
 
   Kilo Code is detected through either official executable (`kilo` or
   `kilocode`) and the exact `@kilocode/cli` package identity. Luvus can resume
@@ -88,6 +89,14 @@ description: What luvus supports per agent, covering live status, session resume
   scan or guess IDs from Kilo's current database. Scheduled Kilo workers are
   available only with explicit **Full access**, which maps to Kilo's documented
   `kilo run --auto` contract; read-only and workspace automation are rejected.
+
+  Devin is detected through its `devin` executable, which is also an ordinary
+  given name, so only process, launch-command, or title evidence names it.
+  Luvus can resume `devin --resume <id>` when an exact session ID was reported
+  and persisted, but does not open Devin's private session database, so
+  `luvus agent resume <id>` cannot find Devin sessions and there is no native
+  fork. Automation profiles and the optional hook integration are not
+  declared yet.
 
   Hermes installs `~/.hermes/plugins/luvus-agent-state`, or the equivalent
   directory under `HERMES_HOME`, and enables only that plugin in
@@ -115,11 +124,12 @@ Print the release-matched instructions for one conversation with
 `luvus skill show`, or install them persistently with `luvus skill enable`.
 
 The shared `~/.agents/skills/luvus/` destination is understood by Codex,
-GitHub Copilot CLI, Gemini CLI, Pi, Cursor, Amp, Droid, fx, and Kilo Code. Luvus
-uses dedicated native destinations for Claude Code, OpenCode, OpenCode 2
-Preview, Kimi Code CLI, Grok Build, Hermes CLI, Qwen Code, Oh My Pi (omp), and
-Kiro. Aider does not expose a native Agent Skills installation directory, so
-use `luvus skill show` when an Aider conversation needs the instructions.
+GitHub Copilot CLI, Gemini CLI, Pi, Cursor, Amp, Droid, fx, Kilo Code, and
+Devin. Luvus uses dedicated native destinations for Claude Code, OpenCode,
+OpenCode 2 Preview, Kimi Code CLI, Grok Build, Hermes CLI, Qwen Code, Oh My Pi
+(omp), and Kiro. Aider does not expose a native Agent Skills installation
+directory, so use `luvus skill show` when an Aider conversation needs the
+instructions.
 
 `luvus skill status` reports the bundled release separately from its managed
 filesystem installations. Codex marketplace plugins are managed by Codex and
