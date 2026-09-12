@@ -102,6 +102,18 @@ Consumers must tolerate absent `graphics_details` on older servers and ignore
 unknown additive fields. Do not interpret the build-support boolean alone as
 permission to draw on the active display.
 
+Inline chunked images are buffered per pane until the complete transfer arrives,
+so concurrent panes cannot interleave their chunks on one host terminal. Pending
+transfers are bounded to 8 MiB / 4,096 commands per pane; an overflow discards the
+partial transfer, including late-attach replay. Incomplete transfers are not
+replayed to newly attached clients. A pane with an unfinished image does not block
+another pane's complete image.
+
+The machine-aware client supports graphics on its owner-local endpoint. Remote
+machine endpoints currently negotiate text-only output to avoid collisions
+between independent servers' image IDs. Check `graphics_details.available` on
+the endpoint in use rather than assuming support from the local terminal.
+
 | Family | Methods |
 |---|---|
 | host / sessions | `host.capabilities` · `host.info` · `host.doctor` · `host.update.check` · `host.update.install` · `session.list` · `session.status` · `session.start` · `session.stop` · `session.restart` · `session.delete` · `skill.status` · `skill.enable` · `skill.disable` · `integration.status` · `integration.install` · `integration.uninstall` |

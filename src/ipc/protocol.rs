@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::sound::SoundSignal;
 use crate::terminal::theme_probe::{CellSize, TerminalColors};
 
-/// Personal integration: upstream machine protocol plus kitty graphics.
+/// Adds terminal graphics negotiation and ordered image delivery to the machine protocol.
 pub const PROTOCOL_VERSION: u32 = 18;
 const MAX_FRAME: usize = 64 * 1024 * 1024;
 
