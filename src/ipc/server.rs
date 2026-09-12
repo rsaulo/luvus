@@ -1306,10 +1306,7 @@ fn apply(
                 });
                 if gone {
                     clients.remove(&id);
-                    if *foreground == Some(id) {
-                        *foreground = latest_client(clients);
-                    }
-                    apply_foreground_client(app, clients, *foreground);
+                    reconcile_client_state(app, clients, foreground);
                 }
             }
             changed

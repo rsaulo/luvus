@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Isolated graphics delivery benchmark, not a host-terminal rendering benchmark.
 
-Uses the version-7 binary display transport with a synthetic graphics-capable
+Uses the version-19 binary display transport with a synthetic graphics-capable
 receiver. Measures producer-to-receiver delivery, server CPU/RSS and idle cost.
 No terminal GPU, PNG decoding or physical screen latency is measured.
 """
@@ -60,7 +60,7 @@ class Display:
         pixels = (bytes(range(256)) * ((side * side * 3 + 255) // 256))[:side * side * 3]
         self.expected_digest = hashlib.sha256(pixels).digest()
         self.supported = supported
-        self.send(uint(0) + uint(18) + uint(240) + uint(80))
+        self.send(uint(0) + uint(19) + uint(240) + uint(80))
         self.thread = threading.Thread(target=self.receive, daemon=True)
         self.thread.start()
 
@@ -86,9 +86,9 @@ class Display:
                 kind, offset = number(data)
                 if kind == 1:
                     version, offset = number(data, offset)
-                    if version != 18 or data[offset] != 0:
-                        raise RuntimeError("expected protocol 18 welcome without error")
-                elif kind == 12:
+                    if version != 19 or data[offset] != 0:
+                        raise RuntimeError("expected protocol 19 welcome without error")
+                elif kind == 13:
                     # TerminalProbe: no colors, Some(graphics), Some(8x16 cell).
                     self.send(uint(12) + b"\x00\x01" + bytes([self.supported]) + b"\x01" + uint(8) + uint(16))
                     self.send(uint(13) + uint(8) + uint(16))
@@ -343,7 +343,7 @@ def main():
     output = pathlib.Path(args.output).resolve() if args.output else None
     if output and not output.is_relative_to(ROOT):
         parser.error("output must be inside this checkout")
-    report = {"scope": "synthetic protocol-18 receiver; server delivery only, no host rendering",
+    report = {"scope": "synthetic protocol-19 receiver; server delivery only, no host rendering",
               "revision": git_value("rev-parse", "HEAD"), "dirty": git_value("status", "--short"),
               "binary_sha256": binary_digest(binary), "harness_sha256": binary_digest(pathlib.Path(__file__)),
               "platform": platform.platform(), "viewport_cells": [240, 80], "cell_pixels": [8, 16],

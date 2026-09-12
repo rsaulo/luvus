@@ -1,7 +1,7 @@
 # Graphics delivery benchmark
 
 `graphics_benchmark.py` runs an isolated release server and a synthetic receiver
-for binary display protocol **18**. It creates real PTYs in a visible workspace,
+for personal-integration binary display protocol **19**. It creates real PTYs in a visible workspace,
 with 1, 2, 4, or 8 panes. It never selects an inherited production socket.
 Temporary server state and producer sockets live under this checkout's `target/`
 and are removed after each case. The supplied binary is not installed or signed
