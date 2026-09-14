@@ -117,6 +117,10 @@ fn read_handshake_message<R: Read>(reader: &mut R) -> Result<ServerMessage> {
     protocol::read_message(reader).map_err(|error| HandshakeIoError(error).into())
 }
 
+fn read_welcome_message<R: Read>(reader: &mut R) -> Result<(u32, Option<String>)> {
+    protocol::read_welcome_message(reader).map_err(|error| HandshakeIoError(error).into())
+}
+
 fn write_handshake_message<W: Write>(writer: &mut W, message: &ClientMessage) -> Result<()> {
     protocol::write_message(writer, message).map_err(|error| HandshakeIoError(error).into())
 }
@@ -243,8 +247,9 @@ struct ClientInput {
     route: InputRoute,
     started: bool,
     colors: Option<crate::terminal::theme_probe::TerminalColors>,
+    /// Cached beside `colors`: a reattach reports the first probe's answer
+    /// rather than querying a stdin the input loop already owns.
     graphics: Option<bool>,
-    cell_size: Option<crate::terminal::theme_probe::CellSize>,
     #[cfg(windows)]
     windows_input_mode: Option<crate::terminal::host_input::WindowsInputModeGuard>,
 }
@@ -279,10 +284,11 @@ where
     #[cfg(not(unix))]
     let completion = crate::clipboard::Completion::local();
     let mut reader = BufReader::new(reader);
-    match read_handshake_message(&mut reader)? {
+    let (server_protocol, handshake_error) = read_welcome_message(&mut reader)?;
+    match handshake_error {
         // The one user-facing handshake failure is an old server after an
         // upgrade — tell them the fix, not just the symptom.
-        ServerMessage::Welcome { error: Some(e), .. } => {
+        Some(error) => {
             crate::logging::event(
                 crate::logging::EventKind::ClientHandshakeRejected,
                 &[
@@ -291,19 +297,24 @@ where
                 ],
             );
             return Err(anyhow!(
-                "server: {e}\nAn older luvus server is likely still running — \
+                "server: {error}\nAn older luvus server is likely still running — \
                  run `luvus server restart` to load this version (your session is saved)."
             ));
         }
-        ServerMessage::Welcome { .. } => {}
-        _ => {
+        None if server_protocol == protocol::PROTOCOL_VERSION => {}
+        None => {
             crate::logging::event(
                 crate::logging::EventKind::ClientHandshakeRejected,
-                &[crate::logging::Field::Reason(
-                    crate::logging::Reason::Handshake,
-                )],
+                &[
+                    crate::logging::Field::Reason(crate::logging::Reason::VersionMismatch),
+                    crate::logging::Field::ProtocolVersion(u64::from(server_protocol)),
+                ],
             );
-            return Err(anyhow!("unexpected handshake"));
+            return Err(anyhow!(
+                "server protocol {server_protocol} does not match client protocol {}\n\
+                 Run `luvus server restart` to load this version (your session is saved).",
+                protocol::PROTOCOL_VERSION
+            ));
         }
     }
 
@@ -311,27 +322,37 @@ where
         ServerMessage::Ready { probe_colors } => probe_colors,
         _ => return Err(anyhow!("unexpected handshake negotiation")),
     };
-    // The probe always runs. The server needs to know whether this terminal can
-    // draw images no matter which theme is configured, and asking costs one
-    // round trip that the palette query would otherwise pay for alone.
-    let pending = if !input.started {
+    // The probe always runs on first attach. The server needs to know whether
+    // this terminal can draw images no matter which theme is configured, and
+    // asking costs one round trip the palette query would otherwise pay alone.
+    let pending = if input.started {
+        // The sole input reader already owns stdin after initial attach, so the
+        // cached answers are reported instead of probing underneath it.
+        protocol::write_message(
+            &mut writer,
+            &ClientMessage::TerminalProbe {
+                colors: input.colors.clone(),
+                graphics: input.graphics,
+            },
+        )?;
+        Vec::new()
+    } else {
         let probe = crate::terminal::theme_probe::probe(probe_colors);
         input.colors = probe.colors;
         input.graphics = probe.graphics;
-        input.cell_size = probe.cell_size;
+        // The measured cell rides the window size this client already reports,
+        // rather than a second field naming the same pixels.
+        protocol::set_probed_cell_pixels(probe.cell_size);
+        protocol::write_message(
+            &mut writer,
+            &ClientMessage::TerminalProbe {
+                colors: input.colors.clone(),
+                graphics: input.graphics,
+            },
+        )?;
         probe.pending
-    } else {
-        Vec::new()
     };
     host.graphics = input.graphics.unwrap_or(false);
-    protocol::write_message(
-        &mut writer,
-        &ClientMessage::TerminalProbe {
-            colors: input.colors.clone(),
-            graphics: input.graphics,
-            cell_size: input.cell_size,
-        },
-    )?;
     crate::logging::event(
         crate::logging::EventKind::ClientHandshake,
         &[
@@ -961,7 +982,8 @@ mod tests {
     }
 
     use super::{
-        copy_and_flush, is_handshake_io_error, read_handshake_message, write_handshake_message,
+        copy_and_flush, is_handshake_io_error, read_handshake_message, read_welcome_message,
+        write_handshake_message,
     };
     use crate::ipc::protocol::{ClientMessage, PROTOCOL_VERSION};
     use std::cell::RefCell;
@@ -981,6 +1003,49 @@ mod tests {
             error.to_string(),
             "connection failed before the Luvus handshake: failed to fill whole buffer"
         );
+    }
+
+    #[test]
+    fn welcome_reader_accepts_frozen_and_v0141_wire_positions() {
+        #[derive(serde::Serialize)]
+        enum FrozenServerMessage {
+            Welcome { version: u32, error: Option<String> },
+        }
+        #[derive(serde::Serialize)]
+        enum V0141ServerMessage {
+            ShellSidebars,
+            Welcome { version: u32, error: Option<String> },
+        }
+
+        let mut frozen = Vec::new();
+        crate::ipc::protocol::write_message(
+            &mut frozen,
+            &FrozenServerMessage::Welcome {
+                version: 5,
+                error: Some("protocol version mismatch".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            read_welcome_message(&mut &frozen[..]).unwrap(),
+            (5, Some("protocol version mismatch".into()))
+        );
+
+        let mut v0141 = Vec::new();
+        crate::ipc::protocol::write_message(
+            &mut v0141,
+            &V0141ServerMessage::Welcome {
+                version: 17,
+                error: Some("protocol version mismatch".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            read_welcome_message(&mut &v0141[..]).unwrap(),
+            (17, Some("protocol version mismatch".into()))
+        );
+
+        let _ = V0141ServerMessage::ShellSidebars;
     }
 
     #[test]
@@ -1283,7 +1348,6 @@ mod tests {
             &ClientMessage::TerminalProbe {
                 colors: Some(colors),
                 graphics: None,
-                cell_size: None,
             },
         )
         .unwrap();

@@ -459,6 +459,74 @@ pub(super) fn run(
     }
 }
 
+fn validate_local_welcome(reader: &mut impl std::io::Read) -> Result<()> {
+    let (server_protocol, error) = protocol::read_welcome_message(reader)?;
+    if let Some(error) = error {
+        return Err(anyhow!(
+            "server: {error}\nAn older luvus server is likely still running — \
+             run `luvus server restart` to load this version (your session is saved)."
+        ));
+    }
+    if server_protocol != PROTOCOL_VERSION {
+        return Err(anyhow!(
+            "server protocol {server_protocol} does not match client {PROTOCOL_VERSION}"
+        ));
+    }
+    Ok(())
+}
+
+struct LocalNegotiation {
+    events_tx: Sender<ShellEvent>,
+    events_rx: mpsc::Receiver<ShellEvent>,
+    probe: crate::terminal::theme_probe::ProbeResult,
+}
+
+/// Performs the local attach handshake through `CellPixels`.
+fn negotiate_local(
+    reader: crate::ipc::transport::Conn,
+    writer: &mut crate::ipc::transport::Conn,
+    (cols, rows): (u16, u16),
+    generation: u64,
+    probe_terminal: impl FnOnce(bool) -> crate::terminal::theme_probe::ProbeResult,
+) -> Result<LocalNegotiation> {
+    protocol::write_message(
+        writer,
+        &ClientMessage::Hello {
+            version: PROTOCOL_VERSION,
+            cols,
+            rows,
+        },
+    )?;
+    let mut reader = BufReader::new(reader);
+    validate_local_welcome(&mut reader)?;
+    let probe_colors = match protocol::read_message::<_, ServerMessage>(&mut reader)? {
+        ServerMessage::Ready { probe_colors } => probe_colors,
+        _ => return Err(anyhow!("unexpected local server negotiation")),
+    };
+    // Windows named-pipe flushes block until the peer reads. The server writes
+    // EndpointIdentity after Ready, so read it before sending negotiation data.
+    let (events_tx, events_rx) = mpsc::sync_channel(8);
+    start_local_reader(reader, events_tx.clone(), generation)?;
+    // The probe always runs: the palette is only read for the Terminal theme,
+    // but whether this terminal draws images describes the terminal itself, and
+    // the local endpoint's panes are shown through it.
+    let probe = probe_terminal(probe_colors);
+    protocol::set_probed_cell_pixels(probe.cell_size);
+    protocol::write_message(
+        writer,
+        &ClientMessage::TerminalProbe {
+            colors: probe.colors.clone(),
+            graphics: probe.graphics,
+        },
+    )?;
+    protocol::write_message(writer, &super::client::cell_pixels_message())?;
+    Ok(LocalNegotiation {
+        events_tx,
+        events_rx,
+        probe,
+    })
+}
+
 fn run_inner(
     reader: crate::ipc::transport::Conn,
     mut writer: crate::ipc::transport::Conn,
@@ -467,41 +535,18 @@ fn run_inner(
 ) -> Result<super::client::ClientExit> {
     let truecolor = protocol::truecolor_supported();
     let size = terminal.size()?;
-    protocol::write_message(
+    let local_generation = 0u64;
+    let LocalNegotiation {
+        events_tx,
+        events_rx,
+        probe,
+    } = negotiate_local(
+        reader,
         &mut writer,
-        &ClientMessage::Hello {
-            version: PROTOCOL_VERSION,
-            cols: size.width,
-            rows: size.height,
-        },
+        (size.width, size.height),
+        local_generation,
+        crate::terminal::theme_probe::probe,
     )?;
-    let mut reader = BufReader::new(reader);
-    match protocol::read_message::<_, ServerMessage>(&mut reader)? {
-        ServerMessage::Welcome { error: None, .. } => {}
-        ServerMessage::Welcome {
-            error: Some(error), ..
-        } => {
-            return Err(anyhow!(
-                "server: {error}\nAn older luvus server is likely still running — \
-                 run `luvus server restart` to load this version (your session is saved)."
-            ))
-        }
-        _ => return Err(anyhow!("unexpected local server handshake")),
-    }
-    let probe_colors = match protocol::read_message::<_, ServerMessage>(&mut reader)? {
-        ServerMessage::Ready { probe_colors } => probe_colors,
-        _ => return Err(anyhow!("unexpected local server negotiation")),
-    };
-    let probe = crate::terminal::theme_probe::probe(probe_colors);
-    protocol::write_message(
-        &mut writer,
-        &ClientMessage::TerminalProbe {
-            colors: probe.colors.clone(),
-            graphics: probe.graphics,
-            cell_size: probe.cell_size,
-        },
-    )?;
-    protocol::write_message(&mut writer, &super::client::cell_pixels_message())?;
 
     let mut machines = profiles
         .into_iter()
@@ -519,9 +564,6 @@ fn run_inner(
     )?;
 
     let writer = Arc::new(Mutex::new(writer));
-    let (events_tx, events_rx) = mpsc::sync_channel(8);
-    let local_generation = 0u64;
-    start_local_reader(reader, events_tx.clone(), local_generation)?;
 
     let _ = execute!(
         std::io::stdout(),
@@ -1475,7 +1517,7 @@ fn handle_surface_message(
                 }
             }
         }
-        ServerMessage::Ready { .. } => {
+        ServerMessage::Ready { probe_colors: _ } => {
             let is_candidate = candidate
                 .as_ref()
                 .is_some_and(|candidate| candidate.endpoint == endpoint);
@@ -1500,13 +1542,12 @@ fn handle_surface_message(
                         .control
                         .as_ref()
                         .ok_or_else(|| anyhow!("remote session connection closed"))?;
-                    // The input reader already owns stdin. Machine endpoints
-                    // have separate image IDs; advertise text-only until those
-                    // namespaces are virtualized across surface switches.
+                    // The input reader already owns the terminal. Reprobing here
+                    // would race keyboard input and block switching, so the
+                    // remote endpoint is told what this shell already knows.
                     control.send(&ClientMessage::TerminalProbe {
                         colors: None,
                         graphics: Some(false),
-                        cell_size: None,
                     })?;
                     control.send(&super::client::cell_pixels_message())?;
                     control.send(&ClientMessage::ShellDockLayout(layout))?;
@@ -5568,6 +5609,87 @@ fn write_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_negotiation_reads_server_identity_before_sending_metadata() {
+        // Windows named-pipe flushes wait for the peer to read. The server sends
+        // EndpointIdentity after Ready, so a client that writes CellPixels before
+        // reading deadlocks with the server and never attaches.
+        for probe_terminal in [false, true] {
+            let dir = std::env::temp_dir().join(format!(
+                "luvus-local-negotiation-{}-{probe_terminal}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let sock = dir.join("s");
+            let _ = std::fs::remove_file(&sock);
+            let listener = crate::ipc::transport::bind(&sock).unwrap();
+            let (app_tx, app_rx) = std::sync::mpsc::channel();
+            let terminal_theme = Arc::new(std::sync::atomic::AtomicBool::new(probe_terminal));
+            std::thread::spawn(move || {
+                let conn = crate::ipc::transport::incoming(&listener).next().unwrap();
+                crate::ipc::server::handle_client(1, conn, app_tx, terminal_theme);
+            });
+
+            let client = crate::ipc::transport::connect(&sock).unwrap();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut writer = client.clone();
+                let result = negotiate_local(client, &mut writer, (80, 24), 0, |_| {
+                    crate::terminal::theme_probe::ProbeResult::default()
+                });
+                let result = result.map(|_| ()).map_err(|error| error.to_string());
+                // Hand the writer back so the connection stays open while the test waits.
+                let _ = done_tx.send((result, writer));
+            });
+
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let (mut connected, mut cell_pixels) = (false, false);
+            while !(connected && cell_pixels) {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                match app_rx.recv_timeout(remaining) {
+                    Ok(crate::event::AppEvent::ClientConnected { .. }) => connected = true,
+                    Ok(crate::event::AppEvent::ClientCellPixels { .. }) => cell_pixels = true,
+                    Ok(_) => {}
+                    Err(_) => panic!(
+                        "local handshake stalled (probe_terminal={probe_terminal}, \
+                         connected={connected}, cell_pixels={cell_pixels})"
+                    ),
+                }
+            }
+            let (result, _writer) = done_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("client negotiation must finish");
+            assert_eq!(result, Ok(()));
+            let _ = std::fs::remove_file(&sock);
+            let _ = std::fs::remove_dir(&dir);
+        }
+    }
+
+    #[test]
+    fn local_handshake_decodes_v0141_mismatch_as_actionable_error() {
+        #[allow(dead_code)]
+        #[derive(serde::Serialize)]
+        enum V0141ServerMessage {
+            ShellSidebars,
+            Welcome { version: u32, error: Option<String> },
+        }
+
+        let mut bytes = Vec::new();
+        protocol::write_message(
+            &mut bytes,
+            &V0141ServerMessage::Welcome {
+                version: 17,
+                error: Some("protocol version mismatch".into()),
+            },
+        )
+        .unwrap();
+
+        let error = validate_local_welcome(&mut &bytes[..]).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("protocol version mismatch"));
+        assert!(message.contains("luvus server restart"));
+    }
 
     #[test]
     fn frame_diff_repaints_only_when_it_touches_the_client_dock() {

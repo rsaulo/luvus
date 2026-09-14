@@ -325,7 +325,6 @@ struct ClientState {
     /// because its backlog overflowed. Held until a frame carrying them is
     /// accepted: a refused frame must not consume the repair.
     graphics_resync: bool,
-    cell_size: Option<crate::terminal::theme_probe::CellSize>,
     render_buf: Buffer,
     last_frame: Option<protocol::FrameData>,
     behind: bool,
@@ -354,6 +353,11 @@ struct RenderScratch {
 }
 
 impl ClientState {
+    /// How big one cell is on this display, when it reports pixel geometry.
+    fn cell_size(&self) -> Option<crate::terminal::theme_probe::CellSize> {
+        crate::terminal::theme_probe::CellSize::from_pixels(self.cell_width_px, self.cell_height_px)
+    }
+
     #[allow(clippy::too_many_arguments)] // Initial per-display handshake state.
     fn new(
         sender: ClientSender,
@@ -363,7 +367,6 @@ impl ClientState {
         cell_height_px: u16,
         terminal_colors: Option<crate::terminal::theme_probe::TerminalColors>,
         graphics: bool,
-        cell_size: Option<crate::terminal::theme_probe::CellSize>,
         last_activity: u64,
     ) -> Self {
         let size = (cols.max(1), rows.max(1));
@@ -376,7 +379,6 @@ impl ClientState {
             graphics,
             graphics_backlog: crate::terminal::graphics::GraphicsBacklog::default(),
             graphics_resync: false,
-            cell_size,
             render_buf: Buffer::empty(Rect::new(0, 0, size.0, size.1)),
             last_frame: None,
             behind: false,
@@ -699,6 +701,9 @@ pub fn run() -> Result<()> {
                 if let Some(client) = clients.get(&id) {
                     let _ = client.send_control(ServerMessage::SwitchSession { name });
                 }
+                foreground = latest_client(&clients);
+                apply_client_state(&mut app, &clients, foreground);
+                render_request.record(RenderCause::UserInterface);
             } else {
                 app.show_toast("no attached client to switch".to_string());
             }
@@ -922,7 +927,6 @@ fn apply(
             rows,
             terminal_colors,
             terminal_graphics,
-            terminal_cell_size,
         } => {
             crate::logging::event(
                 crate::logging::EventKind::ServerClientAttach,
@@ -952,7 +956,6 @@ fn apply(
                     0,
                     terminal_colors,
                     terminal_graphics.unwrap_or(false),
-                    terminal_cell_size,
                     activity,
                 ),
             );
@@ -1167,6 +1170,10 @@ fn apply(
             // the geometry shared state uses, and it never forces a repaint.
             if *foreground == Some(id) {
                 app.set_client_cell_pixels(cell_width_px, cell_height_px);
+                app.set_host_cell_size(crate::terminal::theme_probe::CellSize::from_pixels(
+                    cell_width_px,
+                    cell_height_px,
+                ));
             }
             false
         }
@@ -1219,6 +1226,13 @@ fn apply(
                 client.cell_height_px = cell_height_px;
                 if *foreground == Some(id) {
                     app.set_client_cell_pixels(cell_width_px, cell_height_px);
+                    // Changing font size moves the cell without changing the
+                    // client set, and a pane reports its pixel size from this,
+                    // so the figure follows the geometry it arrived with.
+                    app.set_host_cell_size(crate::terminal::theme_probe::CellSize::from_pixels(
+                        cell_width_px,
+                        cell_height_px,
+                    ));
                 }
                 // Resize/focus repair is local to this terminal. Its next frame
                 // must be complete, but other clients keep their diff baselines.
@@ -1331,6 +1345,8 @@ fn broadcast(clients: &mut Clients, msg: ServerMessage) -> bool {
     clients.len() != before
 }
 
+/// Return whether failed control sends changed the client set, as [`broadcast`]
+/// does: a dropped client leaves shared state to be reconciled once.
 fn broadcast_effect(clients: &mut Clients, msg: ServerMessage) -> bool {
     let before = clients.len();
     clients.retain(|_, client| {
@@ -1399,10 +1415,14 @@ fn apply_client_state(app: &mut App, clients: &Clients, foreground: Option<u64>)
     );
     // Prefer foreground, otherwise the most recently active client. An existing
     // foreground with unknown pixel size must not borrow another display's size.
-    app.set_host_cell_size(display.and_then(|client| client.cell_size));
+    // This is the same window size that decides split geometry: one display, one
+    // measurement, whether it came from the kernel or from the terminal's reply.
+    app.set_host_cell_size(display.and_then(ClientState::cell_size));
 
     app.client_files_visible = client_files_visible(clients);
-    let Some(client) = display else {
+    // Cell pixels drive automatic split geometry; the palette only matters for
+    // the `terminal` theme. Both are per-display, so they follow the foreground.
+    let Some(client) = foreground.and_then(|id| clients.get(&id)) else {
         return;
     };
     app.set_client_cell_pixels(client.cell_width_px, client.cell_height_px);
@@ -2218,7 +2238,12 @@ fn ends_client_writer(message: &ServerMessage) -> bool {
     )
 }
 
-fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme: Arc<AtomicBool>) {
+pub(super) fn handle_client(
+    id: u64,
+    stream: Conn,
+    app_tx: Sender<AppEvent>,
+    terminal_theme: Arc<AtomicBool>,
+) {
     let mut reader = BufReader::new(stream.clone());
     let mut writer = stream;
 
@@ -2234,13 +2259,7 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
                 crate::logging::Field::ProtocolVersion(u64::from(version.unwrap_or(0))),
             ],
         );
-        let _ = protocol::write_message(
-            writer,
-            &ServerMessage::Welcome {
-                version: protocol::PROTOCOL_VERSION,
-                error: Some("protocol version mismatch".into()),
-            },
-        );
+        let _ = protocol::write_version_mismatch(writer, version);
     };
 
     let (cols, rows) = match protocol::read_message::<_, ClientMessage>(&mut reader) {
@@ -2296,13 +2315,9 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
     {
         return;
     }
-    let (terminal_colors, terminal_graphics, terminal_cell_size) =
+    let (terminal_colors, terminal_graphics) =
         match protocol::read_message::<_, ClientMessage>(&mut reader) {
-            Ok(ClientMessage::TerminalProbe {
-                colors,
-                graphics,
-                cell_size,
-            }) => (colors, graphics, cell_size),
+            Ok(ClientMessage::TerminalProbe { colors, graphics }) => (colors, graphics),
             _ => return,
         };
 
@@ -2365,7 +2380,6 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
             rows,
             terminal_colors,
             terminal_graphics,
-            terminal_cell_size,
         })
         .is_err()
     {
@@ -2880,11 +2894,27 @@ mod tests {
                 0,
                 None,
                 graphics,
-                None,
                 activity,
             ),
             rx,
         )
+    }
+
+    #[test]
+    fn machine_catalog_changes_reach_only_machine_aware_clients() {
+        let (mut machine_client, machine_rx) = display_client(80, 24, 2);
+        machine_client.machine_capable = true;
+        let (plain_client, plain_rx) = display_client(80, 24, 1);
+        let mut clients = HashMap::from([(1, plain_client), (2, machine_client)]);
+
+        broadcast_machine_catalog_changed(&mut clients, 7);
+
+        assert!(matches!(
+            machine_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ServerMessage::MachineCatalogChanged { revision: 7 }
+        ));
+        assert!(plain_rx.try_recv().is_err());
+        assert_eq!(clients.len(), 2);
     }
 
     /// A writer freeing a client's graphics gate is the event that delivers a
@@ -2995,7 +3025,6 @@ mod tests {
                 rows: 30,
                 terminal_colors: None,
                 terminal_graphics: Some(graphics),
-                terminal_cell_size: None,
             }));
             rx
         }
@@ -3073,23 +3102,6 @@ mod tests {
             interactive_size: (100, 30),
             scratch: RenderScratch::default(),
         }
-    }
-
-    #[test]
-    fn machine_catalog_changes_reach_only_machine_aware_clients() {
-        let (mut machine_client, machine_rx) = display_client(80, 24, 2);
-        machine_client.machine_capable = true;
-        let (plain_client, plain_rx) = display_client(80, 24, 1);
-        let mut clients = HashMap::from([(1, plain_client), (2, machine_client)]);
-
-        broadcast_machine_catalog_changed(&mut clients, 7);
-
-        assert!(matches!(
-            machine_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
-            ServerMessage::MachineCatalogChanged { revision: 7 }
-        ));
-        assert!(plain_rx.try_recv().is_err());
-        assert_eq!(clients.len(), 2);
     }
 
     fn received_frame_size(rx: &mpsc::Receiver<ServerMessage>) -> (u16, u16) {
@@ -3239,7 +3251,9 @@ mod tests {
             height: 27,
         };
         drawing.clients.get_mut(&latest).unwrap().last_activity = 100;
-        drawing.clients.get_mut(&latest).unwrap().cell_size = Some(cell_size);
+        let latest_client = drawing.clients.get_mut(&latest).unwrap();
+        latest_client.cell_width_px = cell_size.width;
+        latest_client.cell_height_px = cell_size.height;
         super::apply_client_state(&mut drawing.app, &drawing.clients, None);
         assert_eq!(
             drawing.app.host_graphics_for_test().cell_size(),
@@ -3247,205 +3261,6 @@ mod tests {
         );
         super::apply_client_state(&mut drawing.app, &drawing.clients, Some(first));
         assert_eq!(drawing.app.host_graphics_for_test().cell_size(), None);
-    }
-
-    #[test]
-    fn graphics_race_after_collection_defers_cells_until_the_image_is_collected() {
-        let mut drawing = app_with_an_image("graphics-race-after-collection");
-        assert!(drawing.app.take_pane_graphics().is_empty());
-        // Deterministic interleaving: the pass has collected its images, then
-        // a PTY emits a new image and its cells before the live projection.
-        drawing
-            .engine
-            .lock()
-            .unwrap()
-            .advance(&image("a=T,f=32,s=2,v=2,i=9,c=2,r=2,C=1,q=2;NEW"));
-        let outcome = super::render_client(
-            &mut drawing.app,
-            drawing.clients.get_mut(&1).unwrap(),
-            true,
-            false,
-            false,
-            &HashMap::new(),
-        );
-        assert!(
-            !outcome.enqueued,
-            "a live grid cannot overtake image collection"
-        );
-        assert!(drawing.rx.try_recv().is_err());
-        assert!(
-            drawing.client().last_frame.is_none(),
-            "no published baseline was advanced"
-        );
-        assert!(drawing.client().behind);
-
-        // The existing repair pass collects once, then sends image before cells.
-        assert!(drawing.render());
-        let commands = received_images(&drawing.rx);
-        assert!(commands
-            .iter()
-            .any(|command| command.ends_with(b";NEW\x1b\\")));
-        assert_eq!(received_frame_size(&drawing.rx), (100, 30));
-        assert!(!drawing.client().behind);
-        assert!(!drawing.app.pane_graphics_pending());
-    }
-
-    #[test]
-    fn graphics_race_from_render_resize_keeps_both_placement_and_frame_waiting() {
-        let mut drawing = app_with_an_image("graphics-race-render-resize");
-        // This image covers the engine before the first UI layout. Rendering
-        // resizes its pane to the content rect and queues a new placement.
-        drawing
-            .engine
-            .lock()
-            .unwrap()
-            .advance(&image("a=T,f=32,s=100,v=30,i=9,c=100,r=30,C=1,q=2;FULL"));
-        assert!(
-            !drawing.render(),
-            "resize-generated graphics must be collected first"
-        );
-        assert!(drawing.app.pane_graphics_pending());
-        assert!(drawing.client().behind);
-        assert!(!drawing.client().graphics_backlog.is_empty());
-        assert!(
-            drawing.rx.try_recv().is_err(),
-            "neither old image nor new cells escaped"
-        );
-
-        let (cols, rows) = drawing.app.panes[&drawing.app.layout().focus].size();
-        assert_ne!((cols, rows), (100, 30));
-        assert!(drawing.render());
-        let commands = received_images(&drawing.rx);
-        assert!(commands.contains(&image(&format!("a=p,i=9,p=1,U=1,c={cols},r={rows},q=2"))));
-        assert_eq!(received_frame_size(&drawing.rx), (100, 30));
-        assert!(!drawing.client().behind);
-    }
-
-    #[test]
-    fn graphics_race_invalidates_retained_damage_and_leaves_plain_clients_unblocked() {
-        let mut drawing = app_with_an_image("graphics-race-retained-damage");
-        assert!(drawing.render());
-        received_frame_size(&drawing.rx);
-        drawing
-            .client()
-            .sender
-            .frame_pending
-            .store(false, Ordering::Release);
-        drawing.engine.lock().unwrap().advance(b"changed row");
-        let mut damage = HashMap::new();
-        super::capture_visible_terminal_damage(&drawing.app, &mut damage);
-        assert!(damage
-            .values()
-            .all(|snapshot| snapshot.kind == crate::terminal::vt::DamageKind::Partial));
-        drawing
-            .engine
-            .lock()
-            .unwrap()
-            .advance(&image("a=T,f=32,s=2,v=2,i=9,c=2,r=2,C=1,q=2;NEW"));
-        let outcome = super::render_client(
-            &mut drawing.app,
-            drawing.clients.get_mut(&1).unwrap(),
-            true,
-            false,
-            true,
-            &damage,
-        );
-        assert!(!outcome.enqueued, "a damage snapshot is fenced too");
-        assert!(drawing.client().behind);
-        assert!(drawing.rx.try_recv().is_err());
-
-        let (mut plain, rx) = display_client(60, 20, 2);
-        let size = drawing.app.panes[&drawing.app.layout().focus].size();
-        assert!(
-            super::render_client(
-                &mut drawing.app,
-                &mut plain,
-                false,
-                false,
-                false,
-                &HashMap::new()
-            )
-            .enqueued
-        );
-        assert_eq!(received_frame_size(&rx), (60, 20));
-        assert_eq!(drawing.app.panes[&drawing.app.layout().focus].size(), size);
-        assert!(
-            drawing.app.pane_graphics_pending(),
-            "the plain client cannot consume the fence"
-        );
-
-        assert!(drawing.render());
-        assert!(!received_images(&drawing.rx).is_empty());
-        assert_eq!(received_frame_size(&drawing.rx), (100, 30));
-    }
-
-    #[test]
-    fn graphics_race_on_an_unchanged_projection_does_not_flush_an_older_backlog() {
-        let mut drawing = app_with_an_image("graphics-race-unchanged");
-        assert!(drawing.render());
-        received_frame_size(&drawing.rx);
-        drawing
-            .client()
-            .sender
-            .frame_pending
-            .store(false, Ordering::Release);
-        drawing
-            .client()
-            .graphics_backlog
-            .push(&[image("a=T,U=1,i=7,c=2,r=2;OLD")]);
-        // Virtual image-only refresh: no grid mutation, but commands after the
-        // collection boundary still cannot be mixed with this older backlog.
-        drawing
-            .engine
-            .lock()
-            .unwrap()
-            .advance(&image("a=T,U=1,i=7,c=2,r=2;NEW"));
-        let outcome = super::render_client(
-            &mut drawing.app,
-            drawing.clients.get_mut(&1).unwrap(),
-            true,
-            false,
-            false,
-            &HashMap::new(),
-        );
-        assert!(!outcome.enqueued);
-        assert!(drawing.rx.try_recv().is_err());
-        assert!(!drawing.client().graphics_backlog.is_empty());
-        assert!(drawing.client().behind);
-        assert!(drawing.render());
-        assert_eq!(
-            received_images(&drawing.rx),
-            vec![image("a=T,U=1,i=7,c=2,r=2;NEW")]
-        );
-        received_frame_size(&drawing.rx);
-    }
-
-    #[test]
-    fn graphics_race_during_resync_releases_the_reserved_slot_without_consuming_backlog() {
-        let (mut client, rx) = drawing_client(20, 5, 1);
-        let command = image("a=T,U=1,i=7,c=2,r=2;NEW");
-        client.graphics_backlog.push(std::slice::from_ref(&command));
-        let frame = || {
-            ServerMessage::FrameDiff(FrameDiff {
-                width: 20,
-                height: 5,
-                runs: Vec::new(),
-                cursor: None,
-                cursor_visible: false,
-            })
-        };
-        let sent = client.sender.try_send_frame_with_graphics(|| None, frame());
-        assert!(matches!(sent, Err(FrameSendError::GraphicsChanged)));
-        assert!(!client.sender.frame_pending.load(Ordering::Acquire));
-        assert!(!client.graphics_backlog.is_empty());
-        assert!(rx.try_recv().is_err());
-        let backlog = &mut client.graphics_backlog;
-        assert!(client
-            .sender
-            .try_send_frame_with_graphics(|| Some(backlog.take()), frame())
-            .is_ok());
-        assert_eq!(received_images(&rx), vec![command]);
-        assert_eq!(received_frame_size(&rx), (20, 5));
     }
 
     #[test]
@@ -4078,6 +3893,205 @@ mod tests {
     }
 
     #[test]
+    fn graphics_race_after_collection_defers_cells_until_the_image_is_collected() {
+        let mut drawing = app_with_an_image("graphics-race-after-collection");
+        assert!(drawing.app.take_pane_graphics().is_empty());
+        // Deterministic interleaving: the pass has collected its images, then
+        // a PTY emits a new image and its cells before the live projection.
+        drawing
+            .engine
+            .lock()
+            .unwrap()
+            .advance(&image("a=T,f=32,s=2,v=2,i=9,c=2,r=2,C=1,q=2;NEW"));
+        let outcome = super::render_client(
+            &mut drawing.app,
+            drawing.clients.get_mut(&1).unwrap(),
+            true,
+            false,
+            false,
+            &HashMap::new(),
+        );
+        assert!(
+            !outcome.enqueued,
+            "a live grid cannot overtake image collection"
+        );
+        assert!(drawing.rx.try_recv().is_err());
+        assert!(
+            drawing.client().last_frame.is_none(),
+            "no published baseline was advanced"
+        );
+        assert!(drawing.client().behind);
+
+        // The existing repair pass collects once, then sends image before cells.
+        assert!(drawing.render());
+        let commands = received_images(&drawing.rx);
+        assert!(commands
+            .iter()
+            .any(|command| command.ends_with(b";NEW\x1b\\")));
+        assert_eq!(received_frame_size(&drawing.rx), (100, 30));
+        assert!(!drawing.client().behind);
+        assert!(!drawing.app.pane_graphics_pending());
+    }
+
+    #[test]
+    fn graphics_race_from_render_resize_keeps_both_placement_and_frame_waiting() {
+        let mut drawing = app_with_an_image("graphics-race-render-resize");
+        // This image covers the engine before the first UI layout. Rendering
+        // resizes its pane to the content rect and queues a new placement.
+        drawing
+            .engine
+            .lock()
+            .unwrap()
+            .advance(&image("a=T,f=32,s=100,v=30,i=9,c=100,r=30,C=1,q=2;FULL"));
+        assert!(
+            !drawing.render(),
+            "resize-generated graphics must be collected first"
+        );
+        assert!(drawing.app.pane_graphics_pending());
+        assert!(drawing.client().behind);
+        assert!(!drawing.client().graphics_backlog.is_empty());
+        assert!(
+            drawing.rx.try_recv().is_err(),
+            "neither old image nor new cells escaped"
+        );
+
+        let (cols, rows) = drawing.app.panes[&drawing.app.layout().focus].size();
+        assert_ne!((cols, rows), (100, 30));
+        assert!(drawing.render());
+        let commands = received_images(&drawing.rx);
+        assert!(commands.contains(&image(&format!("a=p,i=9,p=1,U=1,c={cols},r={rows},q=2"))));
+        assert_eq!(received_frame_size(&drawing.rx), (100, 30));
+        assert!(!drawing.client().behind);
+    }
+
+    #[test]
+    fn graphics_race_invalidates_retained_damage_and_leaves_plain_clients_unblocked() {
+        let mut drawing = app_with_an_image("graphics-race-retained-damage");
+        assert!(drawing.render());
+        received_frame_size(&drawing.rx);
+        drawing
+            .client()
+            .sender
+            .frame_pending
+            .store(false, Ordering::Release);
+        drawing.engine.lock().unwrap().advance(b"changed row");
+        let mut damage = HashMap::new();
+        super::capture_visible_terminal_damage(&drawing.app, &mut damage);
+        assert!(damage
+            .values()
+            .all(|snapshot| snapshot.kind == crate::terminal::vt::DamageKind::Partial));
+        drawing
+            .engine
+            .lock()
+            .unwrap()
+            .advance(&image("a=T,f=32,s=2,v=2,i=9,c=2,r=2,C=1,q=2;NEW"));
+        let outcome = super::render_client(
+            &mut drawing.app,
+            drawing.clients.get_mut(&1).unwrap(),
+            true,
+            false,
+            true,
+            &damage,
+        );
+        assert!(!outcome.enqueued, "a damage snapshot is fenced too");
+        assert!(drawing.client().behind);
+        assert!(drawing.rx.try_recv().is_err());
+
+        let (mut plain, rx) = display_client(60, 20, 2);
+        let size = drawing.app.panes[&drawing.app.layout().focus].size();
+        assert!(
+            super::render_client(
+                &mut drawing.app,
+                &mut plain,
+                false,
+                false,
+                false,
+                &HashMap::new()
+            )
+            .enqueued
+        );
+        assert_eq!(received_frame_size(&rx), (60, 20));
+        assert_eq!(drawing.app.panes[&drawing.app.layout().focus].size(), size);
+        assert!(
+            drawing.app.pane_graphics_pending(),
+            "the plain client cannot consume the fence"
+        );
+
+        assert!(drawing.render());
+        assert!(!received_images(&drawing.rx).is_empty());
+        assert_eq!(received_frame_size(&drawing.rx), (100, 30));
+    }
+
+    #[test]
+    fn graphics_race_on_an_unchanged_projection_does_not_flush_an_older_backlog() {
+        let mut drawing = app_with_an_image("graphics-race-unchanged");
+        assert!(drawing.render());
+        received_frame_size(&drawing.rx);
+        drawing
+            .client()
+            .sender
+            .frame_pending
+            .store(false, Ordering::Release);
+        drawing
+            .client()
+            .graphics_backlog
+            .push(&[image("a=T,U=1,i=7,c=2,r=2;OLD")]);
+        // Virtual image-only refresh: no grid mutation, but commands after the
+        // collection boundary still cannot be mixed with this older backlog.
+        drawing
+            .engine
+            .lock()
+            .unwrap()
+            .advance(&image("a=T,U=1,i=7,c=2,r=2;NEW"));
+        let outcome = super::render_client(
+            &mut drawing.app,
+            drawing.clients.get_mut(&1).unwrap(),
+            true,
+            false,
+            false,
+            &HashMap::new(),
+        );
+        assert!(!outcome.enqueued);
+        assert!(drawing.rx.try_recv().is_err());
+        assert!(!drawing.client().graphics_backlog.is_empty());
+        assert!(drawing.client().behind);
+        assert!(drawing.render());
+        assert_eq!(
+            received_images(&drawing.rx),
+            vec![image("a=T,U=1,i=7,c=2,r=2;NEW")]
+        );
+        received_frame_size(&drawing.rx);
+    }
+
+    #[test]
+    fn graphics_race_during_resync_releases_the_reserved_slot_without_consuming_backlog() {
+        let (mut client, rx) = drawing_client(20, 5, 1);
+        let command = image("a=T,U=1,i=7,c=2,r=2;NEW");
+        client.graphics_backlog.push(std::slice::from_ref(&command));
+        let frame = || {
+            ServerMessage::FrameDiff(FrameDiff {
+                width: 20,
+                height: 5,
+                runs: Vec::new(),
+                cursor: None,
+                cursor_visible: false,
+            })
+        };
+        let sent = client.sender.try_send_frame_with_graphics(|| None, frame());
+        assert!(matches!(sent, Err(FrameSendError::GraphicsChanged)));
+        assert!(!client.sender.frame_pending.load(Ordering::Acquire));
+        assert!(!client.graphics_backlog.is_empty());
+        assert!(rx.try_recv().is_err());
+        let backlog = &mut client.graphics_backlog;
+        assert!(client
+            .sender
+            .try_send_frame_with_graphics(|| Some(backlog.take()), frame())
+            .is_ok());
+        assert_eq!(received_images(&rx), vec![command]);
+        assert_eq!(received_frame_size(&rx), (20, 5));
+    }
+
+    #[test]
     fn hidden_agent_titles_present_once_including_coalesced_output() {
         let _env = crate::persist::test_env("hidden-agent-title");
         let (tx, _rx) = mpsc::channel();
@@ -4526,7 +4540,6 @@ mod tests {
             0,
             None,
             false,
-            None,
             1,
         );
         let frame = || {

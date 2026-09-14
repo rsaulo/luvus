@@ -13,13 +13,42 @@ use serde::{Deserialize, Serialize};
 use crate::sound::SoundSignal;
 use crate::terminal::theme_probe::{CellSize, TerminalColors};
 
-/// Personal combination of machine clients, graphics and external path effects.
+/// Bumped to 19 when the terminal probe reply grew the host's graphics
+/// capability alongside its colors. This personal integration branch carries
+/// the same number for graphics, machine clients and external path effects
+/// together, so its clients and server must be built from one checkout.
 pub const PROTOCOL_VERSION: u32 = 19;
+/// v0.14.1 shipped protocol 17 with `Welcome` accidentally moved to enum
+/// variant one. Its mismatch reply must use that released position.
+const V0141_PROTOCOL_VERSION: u32 = 17;
 const MAX_FRAME: usize = 64 * 1024 * 1024;
 
+/// What the terminal answered when the probe asked how big a cell is. Written
+/// once per process, before any window size is reported.
+static PROBED_CELL_PIXELS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Remember the probe's measurement as the fallback for [`local_cell_pixels`].
+pub fn set_probed_cell_pixels(cell_size: Option<CellSize>) {
+    PROBED_CELL_PIXELS.store(
+        cell_size.map_or(0, CellSize::pack),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 /// Local display cell size in pixels, or `(0, 0)` when the host does not report it.
+///
+/// The kernel's window size is preferred because it stays current when the user
+/// changes font size, but a terminal is not obliged to fill it, and a multiplexer
+/// between Luvus and the display usually does not. What the terminal answered
+/// when asked directly stands in for those, so a pane still reports a pixel size
+/// to the program drawing in it.
 pub fn local_cell_pixels() -> (u16, u16) {
-    crate::platform::terminal_cell_pixels().unwrap_or((0, 0))
+    crate::platform::terminal_cell_pixels()
+        .or_else(|| {
+            CellSize::unpack(PROBED_CELL_PIXELS.load(std::sync::atomic::Ordering::Relaxed))
+                .map(|cell| (cell.width, cell.height))
+        })
+        .unwrap_or((0, 0))
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -75,9 +104,6 @@ pub enum ClientMessage {
     TerminalProbe {
         colors: Option<TerminalColors>,
         graphics: Option<bool>,
-        /// Pixel size of one cell on the client's terminal, when it reported
-        /// one. A pane's window size carries it to programs that draw images.
-        cell_size: Option<CellSize>,
     },
     /// Display geometry reported after the version-checked handshake.
     CellPixels {
@@ -178,11 +204,14 @@ where
 
 #[derive(Serialize, Deserialize, Clone)]
 pub enum ServerMessage {
-    ShellSidebars(ShellSidebars),
+    /// **Frozen wire position and shape.** `Welcome` is decoded before peers
+    /// agree on a protocol version. Keep it as variant zero and carry new
+    /// negotiation data in messages sent after a successful handshake.
     Welcome {
         version: u32,
         error: Option<String>,
     },
+    ShellSidebars(ShellSidebars),
     /// A full frame — sent first, on resize, and to a freshly-attached client.
     Frame(FrameData),
     /// Only the cells that changed since the last frame (docs/18 — the wire-level
@@ -269,6 +298,59 @@ pub enum ServerMessage {
     MachineCatalogChanged {
         revision: u64,
     },
+}
+
+/// The only historical pre-negotiation server shape that shipped with
+/// `Welcome` outside variant zero. This decoder is shared by local, federated,
+/// and SSH-backed clients so every attach path reports an actionable mismatch.
+#[derive(Deserialize)]
+enum WelcomeHandshakeMessage {
+    Welcome { version: u32, error: Option<String> },
+    V0141Welcome { version: u32, error: Option<String> },
+}
+
+#[allow(dead_code)]
+#[derive(Serialize)]
+enum V0141HandshakeMessage {
+    ShellSidebars,
+    Welcome { version: u32, error: Option<String> },
+}
+
+/// Decode the frozen variant-zero `Welcome` and the released v0.14.1
+/// variant-one shape before the peers have agreed on a protocol version.
+pub(crate) fn read_welcome_message<R: Read>(
+    reader: &mut R,
+) -> std::io::Result<(u32, Option<String>)> {
+    let message: WelcomeHandshakeMessage = read_message(reader)?;
+    Ok(match message {
+        WelcomeHandshakeMessage::Welcome { version, error }
+        | WelcomeHandshakeMessage::V0141Welcome { version, error } => (version, error),
+    })
+}
+
+/// Write a protocol-mismatch response in the shape the peer can decode.
+pub(crate) fn write_version_mismatch<W: Write>(
+    writer: &mut W,
+    peer_version: Option<u32>,
+) -> std::io::Result<()> {
+    let error = Some("protocol version mismatch".to_string());
+    if peer_version == Some(V0141_PROTOCOL_VERSION) {
+        write_message(
+            writer,
+            &V0141HandshakeMessage::Welcome {
+                version: PROTOCOL_VERSION,
+                error,
+            },
+        )
+    } else {
+        write_message(
+            writer,
+            &ServerMessage::Welcome {
+                version: PROTOCOL_VERSION,
+                error,
+            },
+        )
+    }
 }
 
 /// Theme projection for the owner-local Remote Machine form. Keeping this
@@ -748,6 +830,76 @@ mod tests {
             rows,
         } = read_message::<_, LegacyClientMessage>(&mut &buf[..]).unwrap();
         assert_eq!((version, cols, rows), (PROTOCOL_VERSION, 100, 40));
+    }
+
+    /// `Welcome` is the server half of the pre-version handshake. Both an old
+    /// server reply and a current mismatch reply must remain decodable before
+    /// either peer knows whether later messages are compatible.
+    #[test]
+    fn welcome_wire_shape_is_backward_decodable() {
+        #[derive(Serialize, Deserialize)]
+        enum LegacyServerMessage {
+            Welcome { version: u32, error: Option<String> },
+        }
+
+        let mut old_reply = Vec::new();
+        write_message(
+            &mut old_reply,
+            &LegacyServerMessage::Welcome {
+                version: 5,
+                error: Some("protocol version mismatch".into()),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            read_message::<_, ServerMessage>(&mut &old_reply[..]).unwrap(),
+            ServerMessage::Welcome { version: 5, error: Some(error) }
+                if error == "protocol version mismatch"
+        ));
+
+        let mut current_reply = Vec::new();
+        write_message(
+            &mut current_reply,
+            &ServerMessage::Welcome {
+                version: PROTOCOL_VERSION,
+                error: Some("protocol version mismatch".into()),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            read_message::<_, LegacyServerMessage>(&mut &current_reply[..]).unwrap(),
+            LegacyServerMessage::Welcome { version, error: Some(error) }
+                if version == PROTOCOL_VERSION && error == "protocol version mismatch"
+        ));
+    }
+
+    /// v0.14.1 moved `Welcome` to variant one. A current server must answer
+    /// that released client in the shape it can decode, while retaining the
+    /// frozen variant-zero shape for every other protocol generation.
+    #[test]
+    fn version_mismatch_reply_matches_the_requesting_client_wire_shape() {
+        #[allow(dead_code)]
+        #[derive(Deserialize)]
+        enum V0141ServerMessage {
+            ShellSidebars,
+            Welcome { version: u32, error: Option<String> },
+        }
+
+        let mut v0141_reply = Vec::new();
+        write_version_mismatch(&mut v0141_reply, Some(V0141_PROTOCOL_VERSION)).unwrap();
+        assert!(matches!(
+            read_message::<_, V0141ServerMessage>(&mut &v0141_reply[..]).unwrap(),
+            V0141ServerMessage::Welcome { version, error: Some(error) }
+                if version == PROTOCOL_VERSION && error == "protocol version mismatch"
+        ));
+
+        let mut frozen_reply = Vec::new();
+        write_version_mismatch(&mut frozen_reply, Some(6)).unwrap();
+        assert!(matches!(
+            read_message::<_, ServerMessage>(&mut &frozen_reply[..]).unwrap(),
+            ServerMessage::Welcome { version, error: Some(error) }
+                if version == PROTOCOL_VERSION && error == "protocol version mismatch"
+        ));
     }
 
     #[test]

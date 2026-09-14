@@ -89,16 +89,9 @@ pub enum AppEvent {
         terminal_colors: Option<TerminalColors>,
         /// Whether this client's terminal can draw images.
         terminal_graphics: Option<bool>,
-        terminal_cell_size: Option<crate::terminal::theme_probe::CellSize>,
     },
     /// A binary client detached.
     ClientDetach {
-        id: u64,
-    },
-    /// A client's socket writer dequeued the images it was sent, freeing its
-    /// graphics gate. A backlog held back by a taken gate is flushed on this
-    /// event, not by rendering on every tick until the gate happens to be free.
-    ClientGraphicsSent {
         id: u64,
     },
     /// Change one client's frame/input ownership without closing its transport.
@@ -142,6 +135,12 @@ pub enum AppEvent {
         id: u64,
         cell_width_px: u16,
         cell_height_px: u16,
+    },
+    /// A client's socket writer dequeued the images it was sent, freeing its
+    /// graphics gate. A backlog held back by a taken gate is flushed on this
+    /// event, not by rendering on every tick until the gate happens to be free.
+    ClientGraphicsSent {
+        id: u64,
     },
     /// Input from a binary display client. The server unwraps this only after
     /// activating the correct per-client viewport; it never reaches `App`.

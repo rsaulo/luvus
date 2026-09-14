@@ -85,8 +85,8 @@ for an agent to receive it:
 skill into detected native skill locations without overwriting external or
 modified content. The shared `~/.agents/skills/luvus/` copy serves Codex,
 GitHub Copilot CLI, Gemini CLI, Pi, Cursor, Amp, Droid, fx, Kilo Code, and
-Devin. Dedicated adapters serve Claude Code, OpenCode, OpenCode 2 Preview,
-Kimi Code CLI, Grok Build, Hermes CLI, Qwen Code, and Kiro. Aider has no
+Devin. Dedicated adapters serve Claude Code, OpenCode,
+Kimi Code CLI, Grok Build, Hermes CLI, Letta Code, Qwen Code, and Kiro. Aider has no
 native Agent Skills installation surface, so use `luvus skill show` when an
 Aider conversation needs the instructions.
 
@@ -135,6 +135,11 @@ Branch-backed dependencies unblock only after they are merged into the shared
 integration history.
 `task release` requeues active work and releases its path leases, but it does
 not stop the worker pane or discard its worktree.
+`task retry <id>` queues a fresh attempt for terminal `done`, `failed`,
+`review`, or `blocked` work while preserving the old pane, branch, worktree,
+output, and notes. Inspect dependents first because retry is rejected after a
+dependent leaves the queue. Retrying an automation-owned task creates a new
+immutable run from the original run snapshot.
 Use `task add --prompt <text>` or `--prompt-file <path>` for the detailed worker
 briefing. A manual task's prompt can be replaced with `task update` only while
 the task is queued and unassigned; inspect it before starting the worker.
@@ -333,15 +338,13 @@ discovery rather than inferring support from an agent name.
   `luvus integration install antigravity` hook reports only the exact
   conversation id needed for `agy --conversation <id>` restore; screen
   detection remains authoritative for state.
-- Official `opencode` is V2.0.2+. This personal build reads structured SQLite
-  discovery and usage offline. `luvus integration install opencode` adds a
-  CLI-local root-session ownership plugin through `cli.json`. Its
-  `opencode run --auto` automation requires explicit `full_access`.
-- OpenCode 2 Preview is detected separately as `opencode2`. Luvus can launch it
-  and resume an exact known ID with `opencode2 --session <id>`, but does not
-  scan its live SQLite database or reuse the OpenCode V1 integration. Its
-  reviewed unattended command, `opencode2 run --auto`, is available only for
-  an explicit `full_access` automation.
+- OpenCode V2 uses the canonical `opencode` identity; `opencode2` remains a
+  compatibility alias. `luvus integration install opencode` selects the V1 or
+  V2 TUI-local plugin contract, reports only the root session selected in that
+  pane, and never scans V2's live SQLite database. Exact known IDs resume with
+  `opencode --session <id>`. Its reviewed unattended command,
+  `opencode run --auto`, is available only for an explicit `full_access`
+  automation.
 - Kilo Code is detected through the official `kilo` and `kilocode` commands.
   Resume and fork use Kilo's native commands only when Luvus already has the
   exact session ID; Luvus does not scan or guess sessions from Kilo's database.
@@ -350,6 +353,10 @@ discovery rather than inferring support from an agent name.
 - `luvus integration install hermes` adds exact per-pane session ownership for
   restart resume. Hermes detection still works without it, but Luvus does not
   scan Hermes's private history database or guess a session.
+- `luvus integration install letta` adds one quiet `SessionStart` hook that
+  reports only the exact Letta conversation ID selected in that pane. Detection
+  remains native, and Luvus does not inspect Letta memory, credentials,
+  conversations, or cloud state.
 
 Do not claim every shell command resumes after restart. Do not guess native
 session IDs. List sessions and use the exact returned identifier.
@@ -449,6 +456,14 @@ read-only Access denies it. Rename retains the owner name validation and
 `pane.renamed` event. An empty name clears the pane alias.
 
 ## Remote use
+
+For a fleet display, `session.snapshot` terminal rows include `pane_id` plus
+nullable `agent_name` from the operator alias map. Backend titles do not mask
+aliases; native view rows omit the field. Refresh snapshots after alias changes.
+`agent.name` emits no event and does not advance `event_sequence`; `pane.rename`
+updates the same alias map, emits `pane.renamed`, and advances the sequence,
+including when clearing a name. Use pane IDs for routing and as display fallback
+when an older server omits the alias field.
 
 Observe/control `terminal.frame` messages replace the previous capture at the
 frame's own `content_revision`. The acknowledgment revision is not an emitted

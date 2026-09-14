@@ -464,6 +464,11 @@ surface:
   retrying. Leases coordinate declared paths but do not sandbox a shared
   checkout. `task release` requeues an
   active task and releases its path leases; it does not stop the worker pane.
+  `task retry <id>` is the explicit fresh-attempt operation for `done`,
+  `failed`, `review`, or `blocked` work. It preserves the old pane, worktree,
+  branch, output, and notes. Inspect dependents first because retry is rejected
+  after a dependent task leaves the queue. An automation-owned task creates a
+  new immutable run from the original run snapshot.
   `task add --prompt <text>` or `--prompt-file <path>` stores a detailed worker
   briefing; `task update` may replace it only while a manual task is still
   queued and unassigned. Inspect the stored prompt before starting the worker.
@@ -512,12 +517,11 @@ surface:
 - For Antigravity CLI, `luvus integration install antigravity` adds exact
   conversation identity for restore. It is session-only; native screen
   detection remains authoritative for agent state.
-- For official OpenCode V2.0.2+, `luvus integration install opencode` adds
-  exact CLI-local root session ownership through `cli.json`. This personal
-  build reads structured SQLite discovery/usage for `opencode` offline.
-  Both `opencode` and compatibility `opencode2` automation require Full access.
-- `opencode2` retains a separate compatibility identity with exact-ID resume.
-  Prefer the official `opencode` command for SQLite discovery and integration.
+- For OpenCode, `luvus integration install opencode` detects V1 or V2 and adds
+  exact TUI-local root session ownership through the matching integration
+  contract.
+  `opencode2` is a compatibility alias for the canonical `opencode` agent.
+  Never infer V2 session IDs from its live database.
 - Devin has native detection and exact-ID resume only. Do not infer session
   IDs from its private database; `luvus agent resume <id>` cannot find Devin
   sessions, so bind a pane with `luvus pane report --agent devin --session
@@ -525,6 +529,10 @@ surface:
 - For Hermes, `luvus integration install hermes` adds exact per-pane session
   ownership for restart resume. Detection remains native, but Luvus does not
   scan Hermes's private history store.
+- For Letta Code, `luvus integration install letta` adds one quiet session-start
+  hook that reports only the exact conversation ID. Detection remains native.
+  Luvus does not inspect Letta memory, credentials, conversations, or cloud
+  state, and does not advertise native fork or scheduled automation for Letta.
 - Subscribe to events only for a live monitoring request. Stop when its
   condition is satisfied and never retain an unbounded stream.
 

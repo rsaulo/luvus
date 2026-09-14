@@ -233,6 +233,7 @@ orchestration (multiple agents on one project, docs/22):
                              (>85% blocks done; --context remains accepted)
   task update <id> [--prompt <text>|--prompt-file <path>] [--status <s>] [--output <o>] [--note <n>]
   task done <id>             mark done + release its leases
+  task retry <id>            queue a fresh attempt without deleting previous work
   task merge <id>            integrate the task's branch into luvus/integration
                              (isolated worktree, conflicts block the task)
   task release <id>          return a claimed task to the queue
@@ -305,10 +306,10 @@ server:
   server status              is the server running, and what version
   server start               start the background server if it isn't up
   server stop                stop the server (and all panes)
-  server restart             stop + start (load a newly-installed binary)
+  server restart [--all]     stop + start (load a newly-installed binary)
   server update-manifest     fetch the latest agent-detection rules from luvus.dev
                              (applies live if the server is up; else on next start)
-  integration install|uninstall <claude|copilot|codex|antigravity|opencode|kimi|grok|hermes|omp>
+  integration install|uninstall <claude|copilot|codex|antigravity|letta|opencode|kimi|grok|hermes|omp>
                              add/remove luvus's session-resume hook (uninstall
                              removes only luvus's hook, never the agent)
 
@@ -329,6 +330,8 @@ direction. It starts in the target pane's live working directory; with
 root instead. `--no-focus` preserves the caller's current view.
 
 `luvus uhp capabilities` on the owner endpoint reports supported methods. The same RPC through paired `luvus uhp access` adds `access.mode`, `access.allowed_methods`, and gateway connection/request limits; use that effective set for permission-aware clients.
+
+`luvus uhp snapshot` includes nullable `agent_name` operator aliases on terminal rows alongside `pane_id`. Native view rows omit the field. Refresh snapshots after naming: `agent.name` emits no event and does not advance `event_sequence`, while `pane.rename` updates the same map, emits `pane.renamed`, and advances the sequence, including when clearing a name. The event sequence is not an alias ETag because `agent.name` is silent.
 
 ## Prompt wait observation
 

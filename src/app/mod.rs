@@ -30,7 +30,7 @@ mod config_persistence;
 mod cwd;
 pub use board::{
     agent_choices, automation_agent_choices, automation_agent_choices_for,
-    automation_agent_supports, task_agent_choices,
+    automation_agent_supports, task_agent_choices, TaskRetryResult,
 };
 pub(crate) mod diff;
 mod dispatch;
@@ -1777,6 +1777,7 @@ pub enum OrchMenuItem {
     Jump,
     Details,
     Done,
+    Retry,
     Merge,
     Release,
     CopyId,
@@ -1829,6 +1830,10 @@ pub struct PaneStatus {
     pub state: State,
     pub agent: String,
     pub last_activity: Instant,
+    /// One exact follow-up after recent output leaves `ACTIVITY_WINDOW`.
+    /// PTY events move this deadline forward; detection clears it after the
+    /// boundary is inspected, avoiding a 100 ms poll throughout the window.
+    quiet_check_at: Option<Instant>,
     /// When the user last sent input (keystrokes/paste) to this pane. Lets
     /// detection tell a user typing (whose echo is also output) apart from the
     /// agent generating (docs/07). Defaults old so unfocused/new panes aren't
@@ -1895,6 +1900,7 @@ impl PaneStatus {
             state: State::Idle,
             agent,
             last_activity: Instant::now(),
+            quiet_check_at: None,
             // Old by default so a freshly spawned pane's first output isn't gated
             // as "the user is typing".
             last_input: Instant::now()
@@ -5404,6 +5410,23 @@ impl App {
     /// folder with no error anywhere — indistinguishable from luvus ignoring
     /// them. A toast is raised here so every caller reports it the same way.
     pub fn create_workspace_at(&mut self, cwd: PathBuf) -> bool {
+        self.create_workspace_at_with_focus(cwd, true)
+    }
+
+    /// Open a static workspace while optionally preserving the current selection.
+    ///
+    /// Automatic attach-open uses `focus = false`: the new workspace must exist in
+    /// the sidebar, but attaching another client must not move every client away
+    /// from the workspace the server already had selected. Remember the selection
+    /// by stable ID so this stays correct if workspace ordering changes later.
+    fn create_workspace_at_with_focus(&mut self, cwd: PathBuf, focus: bool) -> bool {
+        let previous_selection = if focus {
+            None
+        } else {
+            self.workspaces
+                .get(self.active_ws)
+                .map(|ws| (ws.id.clone(), self.zoomed))
+        };
         let name = ws_name(&cwd);
         let branch = git_branch(&cwd);
         let Some(id) = self.spawn_into(cwd.clone()) else {
@@ -5433,6 +5456,16 @@ impl App {
             crate::logging::EventKind::WorkspaceOpen,
             &[crate::logging::Field::WorkspaceIndex(ws as u64)],
         );
+        if let Some((previous_active_id, previous_zoomed)) = previous_selection {
+            if let Some(previous_active) = self
+                .workspaces
+                .iter()
+                .position(|workspace| workspace.id == previous_active_id)
+            {
+                self.active_ws = previous_active;
+                self.zoomed = previous_zoomed;
+            }
+        }
         true
     }
 
@@ -7991,6 +8024,7 @@ impl App {
     }
 
     fn close_pane(&mut self, id: PaneId) {
+        crate::orch::worker::discard(id);
         let owner = self.pane_location(id);
         let durable = self
             .automation
@@ -8106,6 +8140,7 @@ impl App {
             removed = true;
         }
         if removed {
+            self.repair_active_workspace_after_removal(workspace_index);
             self.emit_event(
                 "workspace.closed",
                 serde_json::json!({"workspace": workspace_index.to_string()}),
@@ -8116,11 +8151,6 @@ impl App {
                     workspace_index as u64,
                 )],
             );
-        }
-        if self.workspaces.is_empty() {
-            self.all_workspaces_closed();
-        } else if self.active_ws >= self.workspaces.len() {
-            self.active_ws = self.workspaces.len() - 1;
         }
     }
 
@@ -8177,6 +8207,7 @@ impl App {
         if suppress_reopen {
             self.remember_closed_workspace_path(closed_root);
         }
+        self.repair_active_workspace_after_removal(index);
         self.emit_event(
             "workspace.closed",
             serde_json::json!({"workspace": index.to_string()}),
@@ -8185,8 +8216,16 @@ impl App {
             crate::logging::EventKind::WorkspaceClose,
             &[crate::logging::Field::WorkspaceIndex(index as u64)],
         );
+    }
+
+    /// Restore a valid active selection before workspace-removal observers run.
+    /// Module hooks build their context synchronously during `emit_event`, so
+    /// publishing the shortened list with the old index can panic immediately.
+    fn repair_active_workspace_after_removal(&mut self, removed_index: usize) {
         if self.workspaces.is_empty() {
             self.all_workspaces_closed();
+        } else if self.active_ws > removed_index {
+            self.active_ws -= 1;
         } else if self.active_ws >= self.workspaces.len() {
             self.active_ws = self.workspaces.len() - 1;
         }
@@ -9914,6 +9953,86 @@ mod tests {
     }
 
     #[test]
+    fn closing_an_auto_opened_workspace_keeps_restored_focus_renderable() {
+        let _env = crate::persist::test_env("close-auto-opened-workspace");
+        let root = std::env::temp_dir().join(format!(
+            "luvus-close-auto-opened-workspace-{}",
+            std::process::id()
+        ));
+        let retained = root.join("retained");
+        let automatic = root.join("automatic");
+        std::fs::create_dir_all(&retained).unwrap();
+        std::fs::create_dir_all(&automatic).unwrap();
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        assert!(app.create_workspace_at(retained.clone()));
+        let selected_id = app.ws().id.clone();
+        let snapshot = crate::persist::snapshot(&app);
+        drop(app);
+
+        let (tx2, _rx2) = std::sync::mpsc::channel();
+        let mut app = App::from_snapshot(snapshot, tx2).expect("workspaces restore");
+        assert_eq!(app.ws().id, selected_id);
+
+        let open = |app: &mut App, focus: bool| {
+            let (reply, _rx) = mpsc::channel();
+            let response = app.handle_api(&ApiRequest {
+                id: "1".into(),
+                method: "workspace.open".into(),
+                params: json!({
+                    "path": automatic.display().to_string(),
+                    "focus": focus,
+                }),
+                reply,
+            });
+            let response: Value = serde_json::from_str(&response).unwrap();
+            assert!(response.get("error").is_none(), "open failed: {response}");
+        };
+
+        open(&mut app, false);
+        assert_eq!(
+            app.ws().id,
+            selected_id,
+            "automatic creation preserves the restored selection"
+        );
+        let automatic_pane = app
+            .workspaces
+            .iter()
+            .find(|workspace| crate::platform::same_path(&workspace.cwd, &automatic))
+            .map(|workspace| workspace.tabs[workspace.active_tab].layout.focus)
+            .expect("automatic workspace exists");
+
+        // A background shell can exit before the next detection tick. Closing it
+        // must leave the restored selection valid for the immediate render.
+        app.handle_event(AppEvent::PtyExit(automatic_pane));
+        assert_eq!(app.ws().id, selected_id);
+        assert!(app.panes.contains_key(&app.layout().focus));
+
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+
+        // The explicitly focused form follows the same close path and must also
+        // fall back to a surviving workspace without waiting for repair.
+        open(&mut app, true);
+        let focused = app.layout().focus;
+        app.handle_event(AppEvent::PtyExit(focused));
+        assert!(app.active_ws < app.workspaces.len());
+        assert!(app.ws().active_tab < app.ws().tabs.len());
+        assert!(app.panes.contains_key(&app.layout().focus));
+        terminal
+            .draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+
+        drop(app);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn workspace_terminal_cwd_follows_the_focused_pane() {
         let _env = crate::persist::test_env("workspace-focused-pane-cwd");
         let (tx, _rx) = std::sync::mpsc::channel();
@@ -10180,6 +10299,92 @@ mod tests {
             );
             assert!(app.status[&pane].agent_session.is_none());
         }
+    }
+
+    #[test]
+    fn reported_session_release_is_idempotent_identity_fenced_and_persistent() {
+        let _env = crate::persist::test_env("reported-session-release");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        let report = |session: &str| {
+            json!({
+                "pane": pane.0.to_string(),
+                "agent": "opencode",
+                "session_id": session,
+                "usage": {
+                    "model": "openai/gpt-5",
+                    "tokens_in": 10,
+                    "tokens_out": 5,
+                    "cache_read": 2,
+                    "cache_write": 1,
+                    "cost": 0.01,
+                    "updated_at": 100
+                }
+            })
+        };
+        let release = |agent: &str, session: &str| {
+            json!({
+                "pane": pane.0.to_string(),
+                "agent": agent,
+                "session_id": session,
+            })
+        };
+
+        assert_eq!(
+            api_call(&mut app, "pane.report_session", report("ses_a"))["result"]["type"],
+            "ok"
+        );
+        let stale = api_call(
+            &mut app,
+            "pane.release_session",
+            release("opencode", "ses_old"),
+        );
+        assert_eq!(stale["error"]["code"], "ownership_conflict");
+        assert_eq!(
+            app.status[&pane].agent_session.as_ref().unwrap().session_id,
+            "ses_a"
+        );
+
+        assert_eq!(
+            api_call(&mut app, "pane.report_session", report("ses_b"))["result"]["type"],
+            "ok"
+        );
+        let delayed = api_call(
+            &mut app,
+            "pane.release_session",
+            release("opencode", "ses_a"),
+        );
+        assert_eq!(delayed["error"]["code"], "ownership_conflict");
+        assert_eq!(
+            app.status[&pane].agent_session.as_ref().unwrap().session_id,
+            "ses_b"
+        );
+
+        let released = api_call(
+            &mut app,
+            "pane.release_session",
+            release("opencode2", "ses_b"),
+        );
+        assert_eq!(released["result"]["released"], true);
+        assert!(app.status[&pane].agent_session.is_none());
+        assert!(!app
+            .reported_usage
+            .contains_key(&crate::mission::UsageKey::new("opencode", "ses_b")));
+
+        let repeated = api_call(
+            &mut app,
+            "pane.release_session",
+            release("opencode", "ses_b"),
+        );
+        assert_eq!(repeated["result"]["released"], false);
+
+        let snapshot = persist::snapshot(&app);
+        let (restored_tx, _restored_rx) = std::sync::mpsc::channel();
+        let restored = App::from_snapshot(snapshot, restored_tx).unwrap();
+        assert!(restored.status[&restored.layout().focus]
+            .agent_session
+            .is_none());
     }
 
     #[test]
@@ -11272,6 +11477,7 @@ mod tests {
 
         app.detect_tick(first);
         let extracted = app.detection_extractions;
+        let considered = app.detection_panes_considered;
         assert!(extracted > 0, "the first tick inspects every pane");
 
         app.detect_tick(first + Duration::from_millis(200));
@@ -11279,12 +11485,15 @@ mod tests {
             app.detection_extractions, extracted,
             "an unchanged pane does not rebuild title or bottom text"
         );
-        assert!(app.detection_skips > 0);
+        assert_eq!(
+            app.detection_panes_considered, considered,
+            "event-driven detection does not revisit a quiet pane between audits"
+        );
 
         if let Some(pane) = app.panes.get(&pane) {
             pane.engine.lock().unwrap().advance(b"new output\r\n");
         }
-        app.detect_tick(first + Duration::from_millis(400));
+        app.detect_tick(first + Duration::from_secs(3));
         assert_eq!(app.detection_extractions, extracted + 1);
     }
 
@@ -13544,9 +13753,42 @@ mod tests {
             "focus:false kept the active workspace on reopen"
         );
 
+        // Adding a previously unknown folder must preserve the same selection.
+        // The already-open assertion above used to pass while this case still
+        // activated the appended workspace unconditionally.
+        let background = std::env::temp_dir().join(format!(
+            "luvus-attach-open-background-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&background).unwrap();
+        let selected_id = app.ws().id.clone();
+        let before = app.workspaces.len();
+        app.zoomed = true;
+        open(&mut app, &background, false);
+        assert_eq!(app.workspaces.len(), before + 1, "new folder is added");
+        assert_eq!(
+            app.ws().id,
+            selected_id,
+            "focus:false preserves selection when it creates a workspace"
+        );
+        assert!(
+            app.zoomed,
+            "focus:false preserves the selected workspace's zoom state"
+        );
+        assert!(app
+            .workspaces
+            .iter()
+            .any(|workspace| crate::platform::same_path(&workspace.cwd, &background)));
+
+        // Explicit open keeps the existing focus behavior for the same folder.
+        open(&mut app, &background, true);
+        assert!(crate::platform::same_path(&app.ws().cwd, &background));
+
         // An explicit open (focus:true) still focuses the folder.
         open(&mut app, &first, true);
         assert_eq!(app.ws().cwd, first, "explicit open still focuses");
+        drop(app);
+        let _ = std::fs::remove_dir_all(background);
     }
 
     #[test]

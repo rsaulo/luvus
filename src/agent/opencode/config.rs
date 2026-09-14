@@ -131,9 +131,9 @@ fn value_end(input: &[u8], start: usize) -> Result<usize> {
         Some(_) => {
             let mut cursor = start;
             while input.get(cursor).is_some_and(|byte| {
-                !(byte.is_ascii_whitespace()
-                    || matches!(byte, b',' | b']' | b'}')
-                    || (matches!(byte, b'/') && matches!(input.get(cursor + 1), Some(b'/' | b'*'))))
+                !byte.is_ascii_whitespace()
+                    && !matches!(byte, b',' | b']' | b'}')
+                    && !(matches!(byte, b'/') && matches!(input.get(cursor + 1), Some(b'/' | b'*')))
             }) {
                 cursor += 1;
             }
@@ -358,7 +358,7 @@ fn remove_element(input: &str, array: &ArrayValue, index: usize) -> String {
     output
 }
 
-fn add_plugin(input: &str, property: &str, spec: &str) -> Result<String> {
+fn add_plugin_for(input: &str, property: &str, spec: &str) -> Result<String> {
     let root = root_object_for(input, property)?;
     let mut output = input.to_string();
     if root.plugin.is_none() {
@@ -390,6 +390,14 @@ pub(super) fn enable(input: &str) -> Result<String> {
     enable_for(input, "plugin", TUI_PLUGIN_SPEC, LEGACY_TUI_PLUGIN_SPEC)
 }
 
+pub(super) fn disable(input: &str) -> Result<String> {
+    disable_for(input, "plugin", TUI_PLUGIN_SPEC, LEGACY_TUI_PLUGIN_SPEC)
+}
+
+pub(super) fn enabled(input: &str) -> bool {
+    enabled_for(input, "plugin", TUI_PLUGIN_SPEC)
+}
+
 pub(super) fn enable_for(
     input: &str,
     property: &str,
@@ -401,7 +409,7 @@ pub(super) fn enable_for(
     loop {
         let root = root_object_for(&output, property)?;
         if root.plugin.is_none() {
-            return add_plugin(&output, property, spec);
+            return add_plugin_for(&output, property, spec);
         }
         let (_, array) = plugin_elements_for(&output, property)?;
         let mut current = Vec::new();
@@ -420,13 +428,9 @@ pub(super) fn enable_for(
         } else if current.len() == 1 {
             return Ok(output);
         } else {
-            return add_plugin(&output, property, spec);
+            return add_plugin_for(&output, property, spec);
         }
     }
-}
-
-pub(super) fn disable(input: &str) -> Result<String> {
-    disable_for(input, "plugin", TUI_PLUGIN_SPEC, LEGACY_TUI_PLUGIN_SPEC)
 }
 
 pub(super) fn disable_for(
@@ -444,19 +448,12 @@ pub(super) fn disable_for(
         };
         let array = array_value(&output, start, end)?;
         let Some(index) = array.elements.iter().copied().position(|element| {
-            matches!(
-                plugin_name(&output, element).as_deref(),
-                Some(value) if value == spec || value == legacy_spec
-            )
+            plugin_name(&output, element).is_some_and(|value| value == spec || value == legacy_spec)
         }) else {
             return Ok(output);
         };
         output = remove_element(&output, &array, index);
     }
-}
-
-pub(super) fn enabled(input: &str) -> bool {
-    enabled_for(input, "plugin", TUI_PLUGIN_SPEC)
 }
 
 pub(super) fn enabled_for(input: &str, property: &str, spec: &str) -> bool {
@@ -466,7 +463,7 @@ pub(super) fn enabled_for(input: &str, property: &str, spec: &str) -> bool {
                 .elements
                 .iter()
                 .copied()
-                .any(|element| plugin_name(input, element).as_deref() == Some(spec))
+                .any(|element| plugin_name(input, element).is_some_and(|value| value == spec))
         })
 }
 

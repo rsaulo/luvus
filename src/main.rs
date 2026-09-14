@@ -99,11 +99,25 @@ fn main() -> Result<()> {
     {
         return remote_client_info(&args);
     }
-    // Private foreground route used only by scheduled worker panes. Keep it
+    // Private foreground routes used only by ORCH worker panes. Keep them
     // ahead of migrations and TUI/server routing: it must run exactly one
     // adapter process, settle its ORCH task, and exit.
+    if args.get(1).map(String::as_str) == Some("__task-worker") {
+        std::process::exit(orch::worker::run(&args)?);
+    }
     if args.get(1).map(String::as_str) == Some("__automation-worker") {
         std::process::exit(automation::run_worker(&args)?);
+    }
+    // A server restart initiated inside one of its panes cannot synchronously
+    // survive that server closing the pane's PTY. `restart_session_via_helper`
+    // launches this private route in a detached process group first.
+    if args.get(1).map(String::as_str) == Some("__restart-session-helper") {
+        if args.len() != 2 {
+            return Err(anyhow!("invalid internal session restart invocation"));
+        }
+        let selected = session::active_name();
+        session::restart_session(selected.as_deref()).map_err(anyhow::Error::msg)?;
+        return Ok(());
     }
 
     // One-time local cleanup of the old default-on skill installation. This
@@ -243,6 +257,13 @@ pub(crate) fn emit_graphics(commands: &[Vec<u8>]) {
     use std::io::Write;
     let mut out = std::io::stdout().lock();
     for command in commands {
+        // These bytes reach the terminal unchanged, so they are checked at the
+        // display boundary rather than trusted for having arrived over the
+        // socket — see [`terminal::graphics::is_wellformed_command`]. A refused
+        // command costs one missing image, never an escape the terminal obeys.
+        if !terminal::graphics::is_wellformed_command(command) {
+            continue;
+        }
         let _ = out.write_all(command);
     }
     let _ = out.flush();
@@ -623,11 +644,10 @@ fn retry_control_probe<T>(
 fn report_server_version(running: String) -> Result<()> {
     let binary = env!("CARGO_PKG_VERSION");
     if running != binary {
-        eprintln!(
+        return Err(anyhow!(
             "luvus v{binary} installed, but the running server is v{running} — \
              run `luvus server restart` to load it (your session is saved and restored)."
-        );
-        thread::sleep(Duration::from_millis(2000));
+        ));
     }
     Ok(())
 }
@@ -996,18 +1016,20 @@ fn server_cmd(args: &[String]) -> Result<()> {
         return ipc::server::run(); // internal role: run the server in the foreground
     };
     let context = i18n::cli::Context::configured();
-    match command {
-        "start" => server_start(context),
-        "stop" => server_stop(context),
-        "restart" => server_restart(context),
-        "status" => server_status(context),
-        "update-manifest" => update_manifest(context),
+    let options = &args[3..];
+    match (command, options) {
+        ("start", []) => server_start(context),
+        ("stop", []) => server_stop(context),
+        ("restart", []) => server_restart(context),
+        ("restart", [flag]) if flag == "--all" => server_restart_all(context),
+        ("status", []) => server_status(context),
+        ("update-manifest", []) => update_manifest(context),
         other => {
-            eprintln!("{}: {other}", context.text("unknown server command"));
+            eprintln!("{}: {}", context.text("unknown server command"), other.0);
             eprintln!(
                 "{}",
                 i18n::cli::help(
-                    "usage: luvus server <start|stop|restart|status|update-manifest>",
+                    "usage: luvus server <start|stop|restart [--all]|status|update-manifest>",
                     context.language(),
                 )
             );
@@ -1168,6 +1190,58 @@ fn server_restart(context: i18n::cli::Context) -> Result<()> {
     Ok(())
 }
 
+/// Restart every server that was running when the command began. Stopped
+/// namespaces remain stopped. The selected session is deliberately last so a
+/// command launched from one of its panes updates every sibling first.
+fn server_restart_all(context: i18n::cli::Context) -> Result<()> {
+    let current = session::display_name();
+    let sessions = restart_all_targets(&current, session::list_sessions()?);
+    if sessions.is_empty() {
+        let sock = persist::client_socket_path();
+        print_server_card(
+            context,
+            context.text("no luvus server running"),
+            None,
+            &sock,
+        );
+        return Ok(());
+    }
+
+    let mut errors = Vec::new();
+    for info in sessions {
+        let selected = (!info.default).then_some(info.name.as_str());
+        let restarted = if info.name == current {
+            session::restart_session_via_helper(selected)
+        } else {
+            session::restart_session(selected)
+        };
+        match restarted {
+            Ok(restarted) => print_server_card_for(
+                context,
+                context.text("restarted"),
+                Some(env!("CARGO_PKG_VERSION")),
+                &session::client_socket_path_for(selected),
+                &restarted.name,
+            ),
+            Err(error) => errors.push(format!("{}: {error}", info.name)),
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!(errors.join("; ")))
+    }
+}
+
+fn restart_all_targets(
+    current: &str,
+    mut sessions: Vec<session::SessionInfo>,
+) -> Vec<session::SessionInfo> {
+    sessions.retain(|info| info.running);
+    sessions.sort_by_key(|info| info.name == current);
+    sessions
+}
+
 /// Poll (bounded) until the server releases its socket, so `stop`/`restart`
 /// return only once the old server is truly gone.
 fn wait_for_shutdown(_sock: &Path) -> Result<()> {
@@ -1223,11 +1297,21 @@ fn print_server_card(
     socket: &Path,
 ) {
     let session = session::display_name();
+    print_server_card_for(context, state, version, socket, &session);
+}
+
+fn print_server_card_for(
+    context: i18n::cli::Context,
+    state: &str,
+    version: Option<&str>,
+    socket: &Path,
+    session: &str,
+) {
     let socket = socket.display().to_string();
     let version = version.map(|value| format!("v{value}"));
     let mut rows = vec![
         (context.text("status"), state),
-        (context.text("session"), session.as_str()),
+        (context.text("session"), session),
     ];
     if let Some(version) = version.as_deref() {
         rows.push((context.text("version"), version));
@@ -1456,13 +1540,18 @@ fn run(terminal: &mut DefaultTerminal) -> Result<bool> {
         app.apply_terminal_colors(colors);
     }
     app.set_host_graphics(probe.graphics.unwrap_or(false));
-    app.set_host_cell_size(probe.cell_size);
-    let pending = probe.pending;
+    ipc::protocol::set_probed_cell_pixels(probe.cell_size);
     // This process owns the terminal here, so measure cells once at startup the
     // way an attaching client reports them after its handshake. Without this a
-    // local session that never resizes would split on the fallback aspect.
+    // local session that never resizes would split on the fallback aspect, and
+    // its panes would report no pixel size to a child drawing in them.
     let (cell_width_px, cell_height_px) = ipc::protocol::local_cell_pixels();
     app.set_client_cell_pixels(cell_width_px, cell_height_px);
+    app.set_host_cell_size(terminal::theme_probe::CellSize::from_pixels(
+        cell_width_px,
+        cell_height_px,
+    ));
+    let pending = probe.pending;
     // Match the client path: query colors before enabling input protocols, so
     // any interleaved bytes are ordinary keys that can be replayed losslessly.
     let _ = execute!(
@@ -1647,6 +1736,50 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+
+    #[test]
+    fn stale_server_version_fails_before_binary_attach() {
+        let error = report_server_version("0.13.4".to_string()).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("running server is v0.13.4"));
+        assert!(message.contains("luvus server restart"));
+    }
+
+    #[test]
+    fn matching_server_version_allows_binary_attach() {
+        report_server_version(env!("CARGO_PKG_VERSION").to_string()).unwrap();
+    }
+
+    #[test]
+    fn restart_all_targets_only_running_sessions_and_puts_selected_last() {
+        let info = |name: &str, running: bool| session::SessionInfo {
+            name: name.to_string(),
+            default: name == session::DEFAULT_SESSION_NAME,
+            running,
+            socket_path: String::new(),
+            session_dir: String::new(),
+            endpoint: session::SessionEndpoint {
+                transport: "test",
+                address: String::new(),
+            },
+        };
+        let targets = restart_all_targets(
+            "alpha",
+            vec![
+                info(session::DEFAULT_SESSION_NAME, true),
+                info("alpha", true),
+                info("stopped", false),
+                info("beta", true),
+            ],
+        );
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| target.name.as_str())
+                .collect::<Vec<_>>(),
+            [session::DEFAULT_SESSION_NAME, "beta", "alpha"]
+        );
+    }
 
     #[test]
     fn send_server_stop_reports_absent_when_no_sockets() {
