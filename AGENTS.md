@@ -25,7 +25,9 @@ pushed or proposed for merge into the upstream repository.
   do not rebase, force-push, or rewrite the personal integration branch.
 - Make personal integration commits on `feat/rsaulo-luvus`, push that branch
   only to `fork` when authorized, and build the locally installed release
-  binary from the resulting integration state.
+  binary from the resulting integration state. After copying it to
+  `~/.local/bin/luvus`, ad-hoc codesign and verify it (see below). Do not ask
+  the user to restart until that verification succeeds.
 - Prepare each upstream contribution on a separate, short-lived branch based
   on the latest `origin/main`, using this same worktree. Cherry-pick or reapply
   only the focused contribution, push that branch to `fork`, and open the PR
@@ -38,6 +40,35 @@ pushed or proposed for merge into the upstream repository.
 - Do not push, open PRs, merge, or switch branches unless the user explicitly
   authorizes the action. Never add this local workflow commit to an upstream
   contribution branch.
+
+### Local release install and macOS signing
+
+The production binary is `~/.local/bin/luvus`. macOS will refuse to exec an
+unsigned replacement (or kill it on restart). After every
+`cargo build --release --locked` that is meant to become the installed
+build:
+
+1. Install the new binary over `~/.local/bin/luvus` without touching the
+   running server.
+2. Ad-hoc sign it:
+
+   ```bash
+   codesign --force --sign - "$HOME/.local/bin/luvus"
+   ```
+
+3. Validate before mentioning restart. Both must succeed, and `-dv` must
+   report `Signature=adhoc`:
+
+   ```bash
+   codesign --verify --verbose=2 "$HOME/.local/bin/luvus"
+   codesign -dv --verbose=2 "$HOME/.local/bin/luvus"
+   ```
+
+4. Only then tell the user the binary is ready and they can
+   `luvus server restart` when convenient. Never restart, stop, or attach
+   to the production server yourself.
+
+If signing or verify fails, fix that first. Do not hand off a restart.
 
 ## Start with current evidence
 
