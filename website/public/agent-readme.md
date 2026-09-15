@@ -143,6 +143,13 @@ immutable run from the original run snapshot.
 Use `task add --prompt <text>` or `--prompt-file <path>` for the detailed worker
 briefing. A manual task's prompt can be replaced with `task update` only while
 the task is queued and unassigned; inspect it before starting the worker.
+Tasks belong to the project selected at creation. Inside a Luvus pane the CLI
+supplies that pane automatically. Outside a pane, pass the stable
+`--workspace-id` when multiple repositories or multiple non-Git projects are
+open. The sole focused Git project remains unambiguous when another workspace
+is only a non-Git launch directory. `task next` stays within that project, and
+path leases overlap only among tasks in the same project, including different
+worktrees of one repository.
 Use `task update --note` for work progress. `task heartbeat --context-used
 <0..1>` reports only the fraction of the model context window already consumed,
 where `0.6` means 60% consumed, not 60% task progress. Omit the heartbeat when
@@ -153,7 +160,9 @@ compatibility alias; UHP keeps the stable `context` field.
 `mode=workspace` creates a dedicated task tab in an existing shared checkout;
 it has no task branch or merge action. If start returns `lease_conflict`,
 resolve or release the named holder before retrying. Leases coordinate declared
-task paths but do not sandbox a workspace-mode agent.
+task paths but do not sandbox a workspace-mode agent. Use `task start
+... --no-focus` to stage the worker without changing the operator's current
+workspace, tab, pane focus, or zoom state.
 
 Tab positions are 1-based. Workspace indexes shown by the CLI are 0-based.
 Pane IDs and agent names are discovery results. Never convert between these
@@ -258,7 +267,8 @@ luvus --session <name> pane list
 
 Each named session owns an independent workspace tree and saved-machine
 catalog. A session switch must not copy workspaces or machine profiles from the
-previous session.
+previous session. An explicit selector for another server also discards the
+caller's inherited pane id because pane identities are session-scoped.
 
 ## Panes and agents
 

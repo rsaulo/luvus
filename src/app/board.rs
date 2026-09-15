@@ -129,6 +129,176 @@ impl App {
         self.session_dirty = true;
     }
 
+    /// Cached project identity for one workspace. No Git command or filesystem
+    /// probe runs here: workspace creation already resolved worktree membership.
+    pub(crate) fn task_project_at(&self, workspace: usize) -> Option<crate::orch::TaskProject> {
+        let workspace = self.workspaces.get(workspace)?;
+        let root = workspace
+            .worktree
+            .as_ref()
+            .map(|membership| membership.common_dir.as_path())
+            .unwrap_or(workspace.cwd.as_path());
+        Some(crate::orch::TaskProject {
+            workspace_id: workspace.id.clone(),
+            root: root.display().to_string(),
+        })
+    }
+
+    /// Pick a workspace for a request with no explicit workspace or pane.
+    /// Multiple non-Git projects remain ambiguous. A sole Git project may be
+    /// selected only while one of its workspaces is focused; this ignores an
+    /// incidental launch-directory workspace without guessing across repos.
+    pub(crate) fn implicit_task_workspace_index(&self) -> Result<Option<usize>, ()> {
+        let Some(active) = self.workspaces.get(self.active_ws) else {
+            return Ok(None);
+        };
+
+        let mut project_roots: Vec<&std::path::Path> = Vec::new();
+        for workspace in &self.workspaces {
+            let root = workspace
+                .worktree
+                .as_ref()
+                .map(|membership| membership.common_dir.as_path())
+                .unwrap_or(workspace.cwd.as_path());
+            if !project_roots
+                .iter()
+                .any(|known| crate::platform::same_path(known, root))
+            {
+                project_roots.push(root);
+            }
+        }
+        if project_roots.len() <= 1 {
+            return Ok(Some(self.active_ws));
+        }
+
+        let Some(active_repo) = active.worktree.as_ref() else {
+            return Err(());
+        };
+        let mut repository_roots: Vec<&std::path::Path> = Vec::new();
+        for workspace in &self.workspaces {
+            let Some(membership) = workspace.worktree.as_ref() else {
+                continue;
+            };
+            let root = membership.common_dir.as_path();
+            if !repository_roots
+                .iter()
+                .any(|known| crate::platform::same_path(known, root))
+            {
+                repository_roots.push(root);
+            }
+        }
+        (project_roots.len() == 2
+            && repository_roots.len() == 1
+            && crate::platform::same_path(repository_roots[0], active_repo.common_dir.as_path()))
+        .then_some(self.active_ws)
+        .ok_or(())
+        .map(Some)
+    }
+
+    /// Resolve the workspace that owns a task and bind projectless legacy tasks
+    /// only when the choice is explicit or the session contains one project.
+    fn resolve_task_workspace(
+        &mut self,
+        task_id: &str,
+        requested_workspace: Option<&str>,
+    ) -> Result<String, (String, String)> {
+        let existing = self
+            .orch
+            .task(task_id)
+            .ok_or_else(|| ("not_found".to_string(), format!("no such task: {task_id}")))?
+            .project
+            .clone();
+
+        let requested = requested_workspace
+            .map(|id| {
+                self.workspaces
+                    .iter()
+                    .position(|workspace| workspace.id == id)
+                    .ok_or_else(|| {
+                        (
+                            "workspace_not_found".to_string(),
+                            format!("workspace id {id} not found"),
+                        )
+                    })
+            })
+            .transpose()?;
+
+        let target = if let Some(existing) = existing.as_ref() {
+            if let Some(requested) = requested {
+                let project = self.task_project_at(requested).ok_or_else(|| {
+                    (
+                        "workspace_not_found".to_string(),
+                        "task workspace is unavailable".to_string(),
+                    )
+                })?;
+                if !crate::platform::same_path(
+                    std::path::Path::new(&existing.root),
+                    std::path::Path::new(&project.root),
+                ) {
+                    return Err((
+                        "workspace_mismatch".to_string(),
+                        format!("{task_id} belongs to another project"),
+                    ));
+                }
+                requested
+            } else {
+                self.workspaces
+                    .iter()
+                    .position(|workspace| workspace.id == existing.workspace_id)
+                    .or_else(|| {
+                        self.workspaces.iter().enumerate().find_map(|(index, _)| {
+                            self.task_project_at(index).and_then(|candidate| {
+                                crate::platform::same_path(
+                                    std::path::Path::new(&candidate.root),
+                                    std::path::Path::new(&existing.root),
+                                )
+                                .then_some(index)
+                            })
+                        })
+                    })
+                    .ok_or_else(|| {
+                        (
+                            "workspace_unavailable".to_string(),
+                            format!("the project workspace for {task_id} is not open"),
+                        )
+                    })?
+            }
+        } else if let Some(requested) = requested {
+            requested
+        } else {
+            match self.implicit_task_workspace_index() {
+                Ok(None) => {
+                    return Err((
+                        "workspace_not_found".to_string(),
+                        "no workspace is available for this task".to_string(),
+                    ));
+                }
+                Ok(Some(workspace)) => workspace,
+                Err(()) => {
+                    return Err((
+                        "workspace_required".to_string(),
+                        format!(
+                            "{task_id} predates project ownership; pass --workspace-id to choose its project"
+                        ),
+                    ));
+                }
+            }
+        };
+
+        if existing.is_none() {
+            let project = self.task_project_at(target).ok_or_else(|| {
+                (
+                    "workspace_not_found".to_string(),
+                    "task workspace is unavailable".to_string(),
+                )
+            })?;
+            self.orch
+                .bind_project(task_id, project)
+                .map_err(|reject| (reject.code.to_string(), reject.message))?;
+        }
+        Ok(self.workspaces[target].id.clone())
+    }
+
     /// ORCH-3: spawn a task worker in the requested mode, then claim it, bind its
     /// declared paths, mark it Running, and optionally launch an agent with the
     /// task briefing. Worktree mode preserves the isolated branch/workspace
@@ -143,6 +313,25 @@ impl App {
         workspace_id: Option<String>,
     ) -> Result<TaskStartResult, (String, String)> {
         self.task_start_impl(id, branch, agent, mode, workspace_id, None)
+    }
+
+    /// Start a manual task while optionally preserving the operator's current
+    /// workspace, tab, pane focus, and zoom state.
+    pub fn task_start_with_focus(
+        &mut self,
+        id: &str,
+        branch: Option<String>,
+        agent: Option<String>,
+        mode: TaskWorkerMode,
+        workspace_id: Option<String>,
+        focus: bool,
+    ) -> Result<TaskStartResult, (String, String)> {
+        let previous = (!focus).then(|| self.task_start_selection()).flatten();
+        let result = self.task_start_impl(id, branch, agent, mode, workspace_id, None);
+        if !focus {
+            self.restore_task_start_selection(&previous);
+        }
+        result
     }
 
     /// Start a scheduled worker with the adapter's reviewed headless command.
@@ -200,6 +389,7 @@ impl App {
         automation_access: Option<crate::automation::AutomationAccess>,
         submit: impl FnOnce(&crate::terminal::pty::Pane, &str) -> Result<(), String>,
     ) -> Result<TaskStartResult, (String, String)> {
+        let workspace_id = self.resolve_task_workspace(id, workspace_id.as_deref())?;
         let task = self
             .orch
             .task(id)
@@ -266,9 +456,9 @@ impl App {
         let previous = self.task_start_selection();
         let prepared = match match mode {
             TaskWorkerMode::Worktree => {
-                self.start_task_worktree(&task, branch, workspace_id.as_deref())
+                self.start_task_worktree(&task, branch, Some(&workspace_id))
             }
-            TaskWorkerMode::Workspace => self.start_task_workspace(&task, workspace_id.as_deref()),
+            TaskWorkerMode::Workspace => self.start_task_workspace(&task, Some(&workspace_id)),
         } {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -1584,15 +1774,19 @@ impl App {
         if start_now && prompt.is_empty() {
             return Err("Prompt is required when Start is Now".into());
         }
+        let project = self
+            .task_project_at(self.active_ws)
+            .ok_or_else(|| "No workspace is available for this task".to_string())?;
         let before = self.orch.clone();
         let task = self
             .orch
-            .add_task_with_prompt(
+            .add_task_with_prompt_in_project(
                 title,
                 (!prompt.is_empty()).then_some(prompt),
                 paths,
                 deps,
                 gate,
+                Some(project),
             )
             .map_err(|error| error.message)?;
         if let Err(error) = self.orch.try_save() {
@@ -2198,7 +2392,13 @@ impl App {
     fn start_worker_from_board(&mut self, id: &str, agent: Option<String>, mode: TaskWorkerMode) {
         let prev_ws = self.active_ws;
         let prev_tab = self.workspaces[prev_ws].active_tab;
-        let workspace_id = if mode == TaskWorkerMode::Workspace {
+        let legacy_projectless = self
+            .orch
+            .task(id)
+            .is_some_and(|task| task.project.is_none());
+        let workspace_id = if legacy_projectless {
+            Some(self.workspaces[prev_ws].id.clone())
+        } else if mode == TaskWorkerMode::Workspace {
             match self
                 .orch
                 .task(id)
@@ -2913,8 +3113,16 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
         app.create_workspace_at(repo.clone()); // the repo becomes the active workspace
+        let project = app.task_project_at(app.active_ws).unwrap();
         app.orch
-            .add_task("auth".into(), vec!["src/auth/**".into()], vec![], None)
+            .add_task_with_prompt_in_project(
+                "auth".into(),
+                None,
+                vec!["src/auth/**".into()],
+                vec![],
+                None,
+                Some(project),
+            )
             .unwrap();
 
         let started = app
@@ -2948,6 +3156,66 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn task_start_without_focus_preserves_the_view_while_opening_a_worktree() {
+        let _env = crate::persist::test_env("orch-start-no-focus");
+        let base = crate::persist::config_dir().join("no-focus-repo");
+        std::fs::create_dir_all(&base).unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&base)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ]);
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        assert!(app.create_workspace_at(base));
+        let original_workspace = app.ws().id.clone();
+        let original_tab = app.ws().tabs[app.ws().active_tab].id.clone();
+        let original_pane = app.layout().focus;
+        app.zoomed = true;
+        app.orch
+            .add_task("background".into(), vec![], vec![], None)
+            .unwrap();
+
+        let started = app
+            .task_start_with_focus(
+                "t1",
+                None,
+                None,
+                TaskWorkerMode::Worktree,
+                Some(original_workspace.clone()),
+                false,
+            )
+            .unwrap();
+
+        assert_ne!(started.workspace_id, original_workspace);
+        assert_eq!(app.ws().id, original_workspace);
+        assert_eq!(app.ws().tabs[app.ws().active_tab].id, original_tab);
+        assert_eq!(app.layout().focus, original_pane);
+        assert!(app.zoomed);
+        assert!(app
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.id == started.workspace_id));
+        assert_eq!(app.orch.task("t1").unwrap().assignee, Some(started.pane.0));
     }
 
     #[test]
@@ -3024,8 +3292,16 @@ mod tests {
         let original_pane = app.layout().focus;
         let workspace_count = app.workspaces.len();
         let pane_count = app.panes.len();
+        let project = app.task_project_at(app.active_ws).unwrap();
         app.orch
-            .add_task("rollback".into(), vec![], vec![], None)
+            .add_task_with_prompt_in_project(
+                "rollback".into(),
+                None,
+                vec![],
+                vec![],
+                None,
+                Some(project),
+            )
             .unwrap();
 
         let error = app
@@ -3216,7 +3492,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_restart_honors_an_explicit_different_workspace() {
+    fn workspace_restart_rejects_an_explicit_different_project() {
         let _env = crate::persist::test_env("orch-workspace-retarget");
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
@@ -3243,7 +3519,7 @@ mod tests {
             .unwrap();
         app.orch.release_task("t1").unwrap();
 
-        let restarted = app
+        let error = app
             .task_start(
                 "t1",
                 None,
@@ -3251,11 +3527,9 @@ mod tests {
                 TaskWorkerMode::Workspace,
                 Some(second_workspace.clone()),
             )
-            .unwrap();
+            .unwrap_err();
 
-        assert_eq!(restarted.workspace_id, second_workspace);
-        assert_ne!(restarted.tab_id, first.tab_id);
-        assert_ne!(restarted.pane, first.pane);
+        assert_eq!(error.0, "workspace_mismatch");
         let binding = app
             .orch
             .task("t1")
@@ -3263,8 +3537,9 @@ mod tests {
             .workspace_worker
             .as_ref()
             .unwrap();
-        assert_eq!(binding.workspace_id, restarted.workspace_id);
-        assert_eq!(binding.tab_id, restarted.tab_id);
+        assert_eq!(binding.workspace_id, first_workspace);
+        assert_eq!(binding.tab_id, first.tab_id);
+        assert_eq!(app.orch.task("t1").unwrap().assignee, None);
         assert!(app
             .workspaces
             .iter()
@@ -3490,8 +3765,16 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
         app.create_workspace_at(repo.clone());
+        let project = app.task_project_at(app.active_ws).unwrap();
         app.orch
-            .add_task("auth".into(), vec![], vec![], None)
+            .add_task_with_prompt_in_project(
+                "auth".into(),
+                None,
+                vec![],
+                vec![],
+                None,
+                Some(project),
+            )
             .unwrap();
 
         let path = app

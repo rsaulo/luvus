@@ -128,12 +128,13 @@ permission to draw on the active display.
 
 Parameter shapes mirror the CLI flags (`luvus task add --paths x` →
 `{"paths": ["x"]}`). For CLI commands, an omitted pane uses
-`$LUVUS_PANE_ID` when available; a raw API request with no pane uses the
-currently focused pane. Methods with a focus default also treat an explicit
-`null` pane as omitted. A well-formed explicit ID that does not name a live
-pane fails with `not_found`; malformed or out-of-range IDs fail with
-`invalid_request` before any mutation. Pane IDs accept an unsigned 32-bit JSON
-integer or its decimal string form.
+`$LUVUS_PANE_ID` when available. Except for the project-scoped task methods
+described below, a raw API request with no pane uses the currently focused
+pane. Methods with a focus default also treat an explicit `null` pane as
+omitted. A well-formed explicit ID that does not name a live pane fails with
+`not_found`; malformed or out-of-range IDs fail with `invalid_request` before
+any mutation. Pane IDs accept an unsigned 32-bit JSON integer or its decimal
+string form.
 
 Machine methods are an opt-in access-gateway surface, not methods of the
 selected session server. `machine.list` takes `{}`. `machine.get`,
@@ -162,6 +163,16 @@ hide their private stored briefing. A queued, unassigned manual task can replace
 or clear its prompt through `task.update` with a string or `null`; prompt edits
 fail closed after the task starts. Capability limits publish the exact UTF-8
 byte budgets as `task_title_bytes` and `task_prompt_bytes`.
+
+`task.add` binds the task to the selected workspace's project and returns a
+`project` object containing its preferred `workspace_id` and durable root.
+Include `workspace_id` when project selection is ambiguous. The sole focused
+Git project remains implicitly selectable beside a non-Git launch-directory
+workspace. A request originating inside a Luvus pane may instead include its
+stable `pane` id. `task.next` filters the ready queue to that project, and path
+leases collide only between tasks in the same project. Git worktrees share the
+repository common directory, so they still coordinate with each other while
+unrelated repositories do not.
 
 For `task.heartbeat`, the canonical UHP `context` field is the fraction of the
 model context window already consumed. `0.6` means 60% of that window has been
@@ -209,8 +220,11 @@ also published by `workspace.list` and `workspace.get`. Filter or correlate on
 `mode: "workspace"`; omitted mode means worktree. Either mode may include a
 stable `workspace_id`; worktree mode creates its branch from that workspace's
 repository, while workspace mode creates a dedicated branchless task tab there.
-`branch` is valid only in worktree mode, and `task.merge` returns
-`merge_unavailable` for a workspace worker.
+The workspace must belong to the task's recorded project. `branch` is valid
+only in worktree mode, and `task.merge` returns
+`merge_unavailable` for a workspace worker. `task.start` also accepts
+`focus: false` to create and start the worker without changing the operator's
+current workspace, tab, pane focus, or zoom state.
 
 `task.retry` accepts `{"id":"t1"}` for terminal `done`, `failed`, `review`, or
 `blocked` work. Manual tasks return to `queued` with an incremented `attempt`
@@ -220,7 +234,7 @@ Retrying from `review` or `blocked` finishes the superseded source run as
 `cancelled` so it cannot block the retry.
 
 ```json
-{"id":"1","method":"task.start","params":{"id":"t3","mode":"workspace","workspace_id":"workspace_example","agent":"codex"}}
+{"id":"1","method":"task.start","params":{"id":"t3","mode":"workspace","workspace_id":"workspace_example","agent":"codex","focus":false}}
 ```
 
 ## Agent automation
