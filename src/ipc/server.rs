@@ -1177,14 +1177,6 @@ fn apply(
             }
             false
         }
-        AppEvent::ClientGraphicsSent { id } => {
-            // Worth a pass only while images are still waiting. The common
-            // case is the gate freed by the very message that emptied the
-            // backlog, and that is not work.
-            clients
-                .get(&id)
-                .is_some_and(|client| !client.graphics_backlog.is_empty())
-        }
         AppEvent::ClientInput { id, input } => {
             let Some(client) = clients.get_mut(&id) else {
                 discard_client_input(input);
