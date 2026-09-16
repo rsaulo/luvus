@@ -2329,6 +2329,9 @@ mod tests {
     /// every draw path — catches panics and layout regressions without a tty.
     #[test]
     fn renders_chrome() {
+        // Default config keeps the runtime-status bar (`tab n/m`); a user's
+        // `bars.off` must not make this integration test depend on $LUVUS_HOME.
+        let _env = crate::persist::test_env("renders-chrome");
         let (tx, _rx) = mpsc::channel::<AppEvent>();
         let mut app = App::new(80, 24, tx).expect("spawn pane");
         // Give the shell a moment to emit its prompt into the grid.

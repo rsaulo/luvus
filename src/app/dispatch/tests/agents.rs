@@ -713,19 +713,15 @@ fn observed_prompt_no_wait_keeps_the_queued_response_and_no_ownership() {
 #[test]
 fn observed_prompt_exited_terminal_releases_ownership_before_pane_removal() {
     let _env = crate::persist::test_env("prompt-terminal-exit");
-    // Exercise prompt/exit ordering without the user's interactive shell rc.
-    #[cfg(unix)]
-    let previous_shell = std::env::var_os("LUVUS_SHELL");
-    #[cfg(unix)]
-    std::env::set_var("LUVUS_SHELL", "/bin/sh");
+    // Pin this pane only. `LUVUS_SHELL` is process-global and would make
+    // parallel tests that expect spawn failure or yanked pane text fail.
+    // Cargo prepends `target/debug/deps` to PATH; a login zsh that runs
+    // oh-my-zsh or nvm can miss the 5s child-exit deadline below.
+    let isolated = crate::persist::config_dir();
+    std::fs::create_dir_all(&isolated).unwrap();
+    std::fs::write(isolated.join("config.json"), r#"{"shell":"/bin/sh"}"#).unwrap();
     let (tx, _rx) = std::sync::mpsc::channel();
-    let app = App::new(80, 24, tx);
-    #[cfg(unix)]
-    match previous_shell {
-        Some(value) => std::env::set_var("LUVUS_SHELL", value),
-        None => std::env::remove_var("LUVUS_SHELL"),
-    }
-    let mut app = app.unwrap();
+    let mut app = App::new(80, 24, tx).unwrap();
     let pane = app.layout().focus;
     mark_codex_prompt_ready(&mut app, pane);
     let (reply, response) = std::sync::mpsc::channel();
