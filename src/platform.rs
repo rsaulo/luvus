@@ -2,6 +2,38 @@
 
 use std::path::{Path, PathBuf};
 
+/// Physical directory identity, used to reject a replacement checkout at an
+/// already-confirmed worktree path. Neither a path nor a Git branch alone is
+/// stable across removal and recreation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct DirectoryIdentity {
+    volume: u64,
+    file: u64,
+}
+
+pub fn directory_identity(path: &Path) -> Option<DirectoryIdentity> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_dir() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(DirectoryIdentity {
+            volume: metadata.dev(),
+            file: metadata.ino(),
+        })
+    }
+    #[cfg(windows)]
+    {
+        windows::directory_identity(path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        None
+    }
+}
+
 /// Atomically move a completed same-directory temporary file over `destination`.
 /// Windows needs replace-existing semantics that `std::fs::rename` does not
 /// provide consistently; Unix rename already has the required behavior.
@@ -1219,8 +1251,13 @@ pub fn open_path(path: &Path) {
                 )
                 .spawn()
                 {
-                    let _ = child.wait();
-                    return;
+                    // Linux launchers can start and still fail to find a handler.
+                    // The macOS and Windows launchers are the only candidates;
+                    // explorer can exit nonzero after a successful handoff.
+                    let ok = child.wait().map(|status| status.success()).unwrap_or(false);
+                    if ok || cfg!(any(target_os = "macos", windows)) {
+                        return;
+                    }
                 }
             }
         });

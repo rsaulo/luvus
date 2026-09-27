@@ -17,6 +17,19 @@ use crate::layout::TileLayout;
 
 const RECENT_FILE_CAP: usize = 12;
 
+/// Resolve a FILES row on the server, so remote clients never interpret it
+/// relative to their own working directory.
+fn absolute_external_path(workspace_cwd: &Path, path: PathBuf) -> PathBuf {
+    let joined = if path.is_absolute() {
+        path
+    } else if workspace_cwd.is_absolute() {
+        workspace_cwd.join(path)
+    } else {
+        path
+    };
+    std::path::absolute(&joined).unwrap_or(joined)
+}
+
 /// Existing native views of one file in the active workspace, split by whether
 /// a later click can recycle them. Both can be set at once: opening a tab for a
 /// file the preview is showing deliberately leaves the preview alone.
@@ -571,13 +584,14 @@ impl App {
     }
 
     fn file_tree_page(&self) -> usize {
+        let filter_rows = if self.file_tree.filter.is_some() {
+            2
+        } else {
+            0
+        };
         self.files_area
             .height
-            .saturating_sub(if self.file_tree.filter.is_some() {
-                3
-            } else {
-                1
-            })
+            .saturating_sub(crate::ui::DOCK_HEADER_ROWS.saturating_add(filter_rows))
             .max(1) as usize
     }
 
@@ -663,8 +677,10 @@ impl App {
     /// No filesystem access here — existence is checked on the client when it
     /// receives [`crate::ipc::protocol::ServerMessage::OpenPath`]. The wire
     /// value is text, so reject a non-UTF-8 path instead of letting serde fail
-    /// later and terminate the client's IPC writer.
+    /// later and terminate the client's IPC writer. Resolve relative tree rows
+    /// against their workspace before handing them to a client on another host.
     pub fn open_path_externally(&mut self, path: PathBuf) {
+        let path = absolute_external_path(&self.ws().cwd, path);
         let Some(path) = path.to_str() else {
             self.show_toast("path is not valid UTF-8");
             return;
@@ -1338,8 +1354,6 @@ impl App {
         match text {
             Some(t) => {
                 self.pending_clipboard = Some(t);
-                let msg = self.catalog.copied;
-                self.show_toast(msg);
             }
             None => self.show_toast("nothing to copy"),
         }
@@ -1363,21 +1377,43 @@ impl App {
         // Text column width: the scroll clamp needs it to measure how many rows a
         // soft-wrapped line really occupies.
         let text_w = rect.map(|r| view_text_w(v, r.width)).unwrap_or(0);
-        // While typing a search query, keys edit the query.
-        if v.search.as_ref().is_some_and(|s| s.editing) {
+        // Active search owns all input. Editing accepts query text; committed
+        // search accepts only navigation and search controls. Everything else
+        // is swallowed so FILE commands cannot mutate or close the view under
+        // the search footer.
+        if v.search.is_some() {
+            let editing = v.search.as_ref().is_some_and(|search| search.editing);
             match key.code {
-                KeyCode::Char(c) => v.search_push(c),
-                KeyCode::Backspace => v.search_backspace(),
-                KeyCode::Enter => {
-                    v.search_commit();
-                    v.search_step(true, viewport); // reveal the first hit
+                KeyCode::Char('i') if super::keys::is_ctrl_chord(key.modifiers) => {
+                    v.search_toggle_case()
                 }
+                KeyCode::Char('u') if super::keys::is_ctrl_chord(key.modifiers) => v.search_clear(),
+                KeyCode::Char(c) if editing && !super::keys::is_ctrl_chord(key.modifiers) => {
+                    v.search_push(c)
+                }
+                KeyCode::Backspace if editing => v.search_backspace(),
+                KeyCode::Enter if editing => {
+                    v.search_commit();
+                    v.reveal_current_match(viewport);
+                }
+                KeyCode::Char('n') if !editing => v.search_step(true, viewport),
+                KeyCode::Char('N') if !editing => v.search_step(false, viewport),
                 KeyCode::Esc => v.search_cancel(),
-                _ => return false,
+                _ => {}
             }
             return true;
         }
         match key.code {
+            KeyCode::Char('i')
+                if super::keys::is_ctrl_chord(key.modifiers) && v.search.is_some() =>
+            {
+                v.search_toggle_case()
+            }
+            KeyCode::Char('u')
+                if super::keys::is_ctrl_chord(key.modifiers) && v.search.is_some() =>
+            {
+                v.search_clear()
+            }
             KeyCode::Char('j') | KeyCode::Down => v.scroll_by(1, viewport, text_w),
             KeyCode::Char('k') | KeyCode::Up => v.scroll_by(-1, viewport, text_w),
             KeyCode::Char('d') => v.scroll_by(viewport as i32 / 2, viewport, text_w),
@@ -1392,8 +1428,6 @@ impl App {
             KeyCode::Char('l') | KeyCode::Right => v.scroll_right(8),
             KeyCode::Char('w') => v.wrap = !v.wrap,
             KeyCode::Char('/') => v.search_begin(),
-            KeyCode::Char('n') => v.search_step(true, viewport),
-            KeyCode::Char('N') => v.search_step(false, viewport),
             // `y` copies the whole file to the clipboard, through the same path
             // as a pane text selection (native clipboard + OSC 52 + a toast).
             KeyCode::Char('y') | KeyCode::Char('c') => {
@@ -1401,14 +1435,7 @@ impl App {
                 return true;
             }
             KeyCode::Char('q') | KeyCode::Char('x') => self.close_pane(id),
-            KeyCode::Esc => {
-                // Esc clears a committed search first, else closes the view.
-                if v.search.is_some() {
-                    v.search_cancel();
-                } else {
-                    self.close_pane(id);
-                }
-            }
+            KeyCode::Esc => self.close_pane(id),
             _ => return false,
         }
         true
@@ -1421,6 +1448,69 @@ mod tests {
     use crate::app::{DockKind, FileMenu, FileMenuItem, Side};
     use crate::layout::Axis;
     use ratatui::{backend::TestBackend, Terminal};
+
+    #[test]
+    fn file_search_consumes_non_search_shortcuts_before_and_after_commit() {
+        let _env = crate::persist::test_env("file-search-input-ownership");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        let mut view = crate::files::FileView::new("sample.txt".into());
+        view.apply(crate::files::FileLoad::Text(vec![
+            "needle".into(),
+            "middle".into(),
+            "needle".into(),
+        ]));
+        view.search_begin();
+        view.search.as_mut().unwrap().extend_text("needle");
+        app.views.insert(pane, ViewKind::File(view));
+
+        for key in ['j', 'w', 'y', 'c', 'q', 'x'] {
+            assert!(
+                app.handle_file_key(pane, KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE))
+            );
+        }
+        let ViewKind::File(view) = &app.views[&pane] else {
+            panic!("file view retained");
+        };
+        assert_eq!(view.scroll, 0);
+        assert!(view.wrap);
+        assert!(view.search.as_ref().unwrap().editing);
+        assert!(app.pending_clipboard.is_none());
+
+        app.handle_file_key(
+            pane,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        );
+        for ch in "needle".chars() {
+            app.handle_file_key(pane, KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        app.handle_file_key(pane, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        for key in ['j', 'w', 'y', 'c', 'q', 'x'] {
+            assert!(
+                app.handle_file_key(pane, KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE))
+            );
+        }
+        let ViewKind::File(view) = &app.views[&pane] else {
+            panic!("file view retained");
+        };
+        assert_eq!(view.scroll, 0);
+        assert!(view.wrap);
+        assert!(!view.search.as_ref().unwrap().editing);
+        assert!(app.pending_clipboard.is_none());
+
+        app.handle_file_key(pane, KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        let ViewKind::File(view) = &app.views[&pane] else {
+            panic!("file view retained");
+        };
+        assert_eq!(view.search.as_ref().unwrap().current, 1);
+
+        app.handle_file_key(pane, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let ViewKind::File(view) = &app.views[&pane] else {
+            panic!("file view retained");
+        };
+        assert!(view.search.is_none());
+    }
 
     #[test]
     fn files_focus_restores_last_side_across_restart() {
@@ -1628,7 +1718,10 @@ mod tests {
         assert_eq!(app.file_tree.cursor, 0, "left returns to the parent");
         app.handle_file_tree_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
         assert_eq!(app.file_tree.cursor, 3);
-        assert_eq!(app.file_tree.scroll, 2, "the last row remains in view");
+        assert_eq!(
+            app.file_tree.scroll, 3,
+            "the one rendered row keeps the last entry in view"
+        );
 
         app.handle_file_tree_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
         assert!(!app.files_focused, "q returns input to the pane");
@@ -1782,7 +1875,8 @@ mod tests {
         seed_keyboard_tree(&mut app);
         let cursor = app.file_tree.cursor;
         let path = app.file_tree.visible_rows()[cursor].path.clone();
-        let expected = path.to_str().expect("fixture path is UTF-8");
+        let expected_path = super::absolute_external_path(&app.ws().cwd, path);
+        let expected = expected_path.to_str().expect("fixture path is UTF-8");
 
         app.handle_file_tree_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
         assert_eq!(app.pending_open_path.as_deref(), Some(expected), "bare o");
@@ -1822,6 +1916,17 @@ mod tests {
         app.file_menu_action_pub(FileMenuItem::OpenInOs);
         assert_eq!(app.pending_open_path.as_deref(), path.to_str());
         assert!(app.file_menu.is_none());
+    }
+
+    #[test]
+    fn open_path_externally_makes_a_relative_row_absolute() {
+        let _env = crate::persist::test_env("files-open-externally-relative");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.open_path_externally(PathBuf::from("notes.pdf"));
+        let queued = app.pending_open_path.expect("queued");
+        assert!(Path::new(&queued).is_absolute());
+        assert!(queued.ends_with("notes.pdf"));
     }
 
     /// `PathBuf` serializes through UTF-8 in serde. Refuse an unrepresentable
@@ -3284,7 +3389,15 @@ mod tests {
             Some("line one\nline two"),
             "the file content is queued to the clipboard"
         );
-        assert!(app.toast.is_some(), "a copy toast is shown");
+        assert!(
+            app.toast.is_none(),
+            "queueing a copy is not clipboard success"
+        );
+        app.handle_event(crate::event::AppEvent::LocalClipboardSucceeded);
+        assert_eq!(
+            app.toast.as_ref().map(|(text, _)| text.as_str()),
+            Some("Copied to Clipboard")
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

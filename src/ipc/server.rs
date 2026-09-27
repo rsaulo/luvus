@@ -341,6 +341,7 @@ struct ClientState {
     behind: bool,
     force_full: bool,
     retained_pane_content: Vec<(crate::ids::PaneId, Rect)>,
+    retained_hyperlinks: Vec<crate::app::RenderedHyperlink>,
     retained_ready: bool,
     last_activity: u64,
     interest: SurfaceInterest,
@@ -353,6 +354,7 @@ struct ClientState {
     last_shell_dock: Option<protocol::ShellDockRect>,
     last_shell_workspaces: Vec<protocol::ShellWorkspace>,
     shell_dock_dirty: bool,
+    clipboard_receipt: Option<u64>,
 }
 
 #[derive(Default)]
@@ -395,6 +397,7 @@ impl ClientState {
             behind: false,
             force_full: true,
             retained_pane_content: Vec::new(),
+            retained_hyperlinks: Vec::new(),
             retained_ready: false,
             last_activity,
             interest: SurfaceInterest::Active,
@@ -407,6 +410,7 @@ impl ClientState {
             last_shell_dock: None,
             last_shell_workspaces: Vec::new(),
             shell_dock_dirty: false,
+            clipboard_receipt: None,
         }
     }
 
@@ -798,7 +802,8 @@ pub fn run() -> Result<()> {
         // desktop that never asked for it.
         app.pending_open_path = None;
         if let Some(text) = app.pending_clipboard.take() {
-            clients_removed |= broadcast_effect(&mut clients, ServerMessage::Clipboard(text));
+            clients_removed |=
+                dispatch_clipboard(&mut clients, foreground, &mut next_activity, text);
         }
         if clients_removed {
             reconcile_client_state(&mut app, &mut clients, &mut foreground);
@@ -968,6 +973,7 @@ fn apply(
                     activity,
                 ),
             );
+            app.commander = None;
             *foreground = Some(id);
             apply_client_state(app, clients, *foreground);
             // The panes this client is about to be shown may already hold
@@ -992,6 +998,10 @@ fn apply(
             );
             let was_foreground = *foreground == Some(id);
             if clients.remove(&id).is_some() {
+                app.client_files_visible = client_files_visible(clients);
+                if was_foreground {
+                    app.commander = None;
+                }
                 reconcile_client_state(app, clients, foreground);
             }
             was_foreground
@@ -1020,6 +1030,7 @@ fn apply(
             client.retained_ready = false;
             client.retained_pane_content.clear();
             if *foreground == Some(id) {
+                app.commander = None;
                 *foreground = latest_client(clients);
             }
             apply_client_state(app, clients, *foreground);
@@ -1048,8 +1059,12 @@ fn apply(
             if interest == SurfaceInterest::Active {
                 client.last_activity = *next_activity;
                 *next_activity = next_activity.saturating_add(1);
+                if *foreground != Some(id) {
+                    app.commander = None;
+                }
                 *foreground = Some(id);
             } else if *foreground == Some(id) {
+                app.commander = None;
                 *foreground = latest_client(clients);
             }
             apply_client_state(app, clients, *foreground);
@@ -1186,6 +1201,22 @@ fn apply(
             }
             false
         }
+        AppEvent::ClientClipboardSucceeded { id, receipt } => {
+            if *foreground != Some(id) {
+                return false;
+            }
+            let Some(client) = clients.get_mut(&id) else {
+                return false;
+            };
+            if client.interest != SurfaceInterest::Active
+                || client.clipboard_receipt != Some(receipt)
+            {
+                return false;
+            }
+            client.clipboard_receipt = None;
+            app.show_toast(app.catalog.copied);
+            true
+        }
         AppEvent::ClientInput { id, input } => {
             let Some(client) = clients.get_mut(&id) else {
                 discard_client_input(input);
@@ -1254,6 +1285,7 @@ fn apply(
             // geometry and PTY dimensions synchronously.
             let promoted = *foreground != Some(id);
             if promoted {
+                app.commander = None;
                 *foreground = Some(id);
                 apply_client_state(app, clients, *foreground);
             }
@@ -1282,54 +1314,77 @@ fn apply(
                 ClientInput::PasteImage(path) => AppEvent::PasteImage(path),
                 ClientInput::Resize { .. } => unreachable!("handled above"),
             };
-            let client = clients
-                .get_mut(&id)
-                .expect("input client remains registered");
-            let scoped = client.machine_capable && client.shell_dock_layout.owns_workspaces;
-            let changed = if !scoped {
-                app.handle_event(event)
-            } else {
-                let previous = app.sidebars.clone();
-                let previous_workspace_paths = app.config.layout.workspace_paths;
-                if let Some(state) = &client.shell_sidebars {
-                    app.sidebars = crate::app::Sidebars::from_config(&state.layout);
-                    app.config.layout.workspace_paths = state.workspace_paths;
+            let changed = {
+                let client = clients
+                    .get_mut(&id)
+                    .expect("input client remains registered");
+                let scoped = client.machine_capable && client.shell_dock_layout.owns_workspaces;
+                if !scoped {
+                    let changed = app.handle_event(event);
+                    if let Some(text) = app
+                        .commander
+                        .as_mut()
+                        .and_then(|commander| commander.pending_clipboard.take())
+                    {
+                        let _ = client.send_control(ServerMessage::Clipboard(text));
+                    }
+                    changed
+                } else {
+                    let previous = app.sidebars.clone();
+                    let previous_workspace_paths = app.config.layout.workspace_paths;
+                    if let Some(state) = &client.shell_sidebars {
+                        app.sidebars = crate::app::Sidebars::from_config(&state.layout);
+                        app.config.layout.workspace_paths = state.workspace_paths;
+                    }
+                    app.client_sidebar_input = true;
+                    let changed = app.handle_event(event);
+                    // The composer belongs to this exact input client. Deliver its
+                    // copy/cut effect here, before another input can take foreground,
+                    // rather than using the ordinary all-clients clipboard broadcast.
+                    if let Some(text) = app
+                        .commander
+                        .as_mut()
+                        .and_then(|commander| commander.pending_clipboard.take())
+                    {
+                        let _ = client.send_control(ServerMessage::Clipboard(text));
+                    }
+                    app.client_sidebar_input = false;
+                    let layout = app.sidebars.to_config();
+                    let workspace_paths = app.config.layout.workspace_paths;
+                    app.sidebars = previous;
+                    app.config.layout.workspace_paths = previous_workspace_paths;
+                    let revision = client.shell_sidebars.as_ref().map_or(1, |state| {
+                        state.revision.saturating_add(u64::from(
+                            state.layout != layout || state.workspace_paths != workspace_paths,
+                        ))
+                    });
+                    client.shell_sidebars = Some(protocol::ShellSidebars {
+                        revision,
+                        layout,
+                        workspace_paths,
+                    });
+                    client.sidebar_cache = client
+                        .shell_sidebars
+                        .as_ref()
+                        .map(|state| crate::app::Sidebars::from_config(&state.layout));
+                    changed
                 }
-                app.client_sidebar_input = true;
-                let changed = app.handle_event(event);
-                app.client_sidebar_input = false;
-                let layout = app.sidebars.to_config();
-                let workspace_paths = app.config.layout.workspace_paths;
-                app.sidebars = previous;
-                app.config.layout.workspace_paths = previous_workspace_paths;
-                let revision = client.shell_sidebars.as_ref().map_or(1, |state| {
-                    state.revision.saturating_add(u64::from(
-                        state.layout != layout || state.workspace_paths != workspace_paths,
-                    ))
-                });
-                client.shell_sidebars = Some(protocol::ShellSidebars {
-                    revision,
-                    layout,
-                    workspace_paths,
-                });
-                client.sidebar_cache = client
-                    .shell_sidebars
-                    .as_ref()
-                    .map(|state| crate::app::Sidebars::from_config(&state.layout));
-                changed
             };
-            // Route desktop effects to the client whose input produced them,
-            // after restoring shared sidebar state for machine-aware clients.
+            // Route desktop effects to the exact initiating client after
+            // restoring the shared sidebar state for machine-aware clients.
+            let mut changed = changed;
             if let Some(path) = app.pending_open_path.take() {
                 let gone = clients.get(&id).is_some_and(|client| {
-                    client
-                        .sender
-                        .send_control(ServerMessage::OpenPath(path))
-                        .is_err()
+                    client.send_control(ServerMessage::OpenPath(path)).is_err()
                 });
                 if gone {
                     clients.remove(&id);
+                    app.client_files_visible = client_files_visible(clients);
+                    if *foreground == Some(id) {
+                        app.commander = None;
+                    }
                     reconcile_client_state(app, clients, foreground);
+                    changed = true;
                 }
             }
             changed
@@ -1360,6 +1415,33 @@ fn broadcast_effect(clients: &mut Clients, msg: ServerMessage) -> bool {
     let before = clients.len();
     clients.retain(|_, client| {
         client.interest != SurfaceInterest::Active || client.send_control(msg.clone()).is_ok()
+    });
+    clients.len() != before
+}
+
+fn dispatch_clipboard(
+    clients: &mut Clients,
+    foreground: Option<u64>,
+    next_receipt: &mut u64,
+    text: String,
+) -> bool {
+    let before = clients.len();
+    clients.retain(|id, client| {
+        if client.interest != SurfaceInterest::Active {
+            return true;
+        }
+        let message = if foreground == Some(*id) {
+            let receipt = *next_receipt;
+            *next_receipt = next_receipt.saturating_add(1);
+            client.clipboard_receipt = Some(receipt);
+            ServerMessage::ClipboardTracked {
+                text: text.clone(),
+                receipt,
+            }
+        } else {
+            ServerMessage::Clipboard(text.clone())
+        };
+        client.send_control(message).is_ok()
     });
     clients.len() != before
 }
@@ -1397,6 +1479,7 @@ fn latest_client(clients: &Clients) -> Option<u64> {
 /// A newly foreground view needs a frame-capped repair even if it already
 /// received a passive frame and no subsequent PTY or input event arrives.
 fn reconcile_client_state(app: &mut App, clients: &mut Clients, foreground: &mut Option<u64>) {
+    app.client_files_visible = client_files_visible(clients);
     if foreground.is_none_or(|id| !clients.contains_key(&id)) {
         *foreground = latest_client(clients);
         if let Some(client) = foreground.and_then(|id| clients.get_mut(&id)) {
@@ -1550,6 +1633,7 @@ fn render_clients(
         return false;
     }
     if foreground.is_none_or(|id| !clients.contains_key(&id)) {
+        app.commander = None;
         *foreground = latest_client(clients);
         apply_client_state(app, clients, *foreground);
     }
@@ -1623,6 +1707,9 @@ fn render_clients(
     if !scratch.dead.is_empty() {
         for id in scratch.dead.drain(..) {
             clients.remove(&id);
+        }
+        if foreground.is_some_and(|id| !clients.contains_key(&id)) {
+            app.commander = None;
         }
         reconcile_client_state(app, clients, foreground);
     }
@@ -1817,6 +1904,7 @@ fn render_client(
         client.last_frame = None;
         client.force_full = true;
         client.retained_ready = false;
+        client.retained_hyperlinks.clear();
     }
 
     // An overflowed backlog dropped commands, so nothing partial can repair it:
@@ -1835,9 +1923,15 @@ fn render_client(
         && client.last_frame.is_some();
     let patched = if may_patch {
         let mut target = ui::RenderTarget::new(&mut client.render_buf, area);
-        ui::patch_terminal_damage(&mut target, app, &client.retained_pane_content, damage)
-            .map(|()| (target.cursor(), target.cursor_visible()))
-            .ok()
+        ui::patch_terminal_damage(
+            &mut target,
+            app,
+            &client.retained_pane_content,
+            damage,
+            &mut client.retained_hyperlinks,
+        )
+        .map(|()| (target.cursor(), target.cursor_visible()))
+        .ok()
     } else {
         None
     };
@@ -1910,6 +2004,9 @@ fn render_client(
             client
                 .retained_pane_content
                 .clone_from(&app.pane_content_rects);
+            client
+                .retained_hyperlinks
+                .clone_from(&app.rendered_hyperlinks);
             client.retained_ready = true;
             (
                 ui::shell_overlay_rect(app, area),
@@ -1925,6 +2022,7 @@ fn render_client(
         } else {
             let projection = ui::render_projection(&mut target, app);
             client.retained_pane_content = projection.pane_content;
+            client.retained_hyperlinks = projection.hyperlinks;
             client.retained_ready = true;
             app.client_shell_dock_rect = projection.shell_dock;
             (
@@ -2003,6 +2101,15 @@ fn render_client(
             shell_workspace_projection(app),
         )
     };
+    // Hover changes terminal styling, so it disables retained row patching,
+    // but it does not cover the freshly rendered link text. Test eligibility
+    // without that one style-only state; every real overlay remains fail-closed.
+    let hover_link = app.hover_link.take();
+    let hyperlinks_uncovered = ui::retained_pty_eligible(app);
+    app.hover_link = hover_link;
+    if !hyperlinks_uncovered {
+        client.retained_hyperlinks.clear();
+    }
     if scoped_sidebars {
         std::mem::swap(
             &mut app.sidebars,
@@ -2085,11 +2192,9 @@ fn render_client(
                 || previous.height != client.render_buf.area.height
         });
     let message = if full {
-        client.last_frame = Some(protocol::frame_from_buffer(
-            &client.render_buf,
-            cursor,
-            cursor_visible,
-        ));
+        let mut frame = protocol::frame_from_buffer(&client.render_buf, cursor, cursor_visible);
+        frame.hyperlinks = protocol::frame_hyperlinks(&frame, &client.retained_hyperlinks);
+        client.last_frame = Some(frame);
         Some(ServerMessage::Frame(
             client.last_frame.as_ref().expect("frame stored").clone(),
         ))
@@ -2097,9 +2202,15 @@ fn render_client(
         let previous = client.last_frame.as_mut().expect("frame baseline exists");
         let cursor_moved = previous.cursor != cursor || previous.cursor_visible != cursor_visible;
         let runs = protocol::diff_buffer(previous, &client.render_buf);
+        let current_hyperlinks = protocol::frame_hyperlinks(previous, &client.retained_hyperlinks);
+        let hyperlinks_changed = previous.hyperlinks != current_hyperlinks;
+        let linked_cells_changed = protocol::diff_intersects_hyperlinks(&runs, &current_hyperlinks);
+        previous.hyperlinks = current_hyperlinks;
         previous.cursor = cursor;
         previous.cursor_visible = cursor_visible;
-        if runs.is_empty() && !cursor_moved {
+        if hyperlinks_changed || linked_cells_changed {
+            Some(ServerMessage::Frame(previous.clone()))
+        } else if runs.is_empty() && !cursor_moved {
             None
         } else {
             Some(ServerMessage::FrameDiff(protocol::FrameDiff {
@@ -2439,6 +2550,14 @@ pub(super) fn handle_client(
                     .is_err()
                 {
                     crate::clipboard_image::discard_staged_png(&path);
+                    break;
+                }
+            }
+            Ok(ClientMessage::ClipboardSucceeded { receipt }) => {
+                if app_tx
+                    .send(AppEvent::ClientClipboardSucceeded { id, receipt })
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -2793,11 +2912,11 @@ mod shutdown {
 mod tests {
     use super::ServerMessage;
     use super::{
-        apply, broadcast, broadcast_effect, broadcast_machine_catalog_changed, ends_client_writer,
-        flush_graphics, frame_cadence_ready, frame_wait, handle_client, pty_rearm_interval,
-        record_event_render_request, render_clients, shell_workspace_projection, ClientSender,
-        ClientState, Clients, EventRenderSource, FrameSendError, RenderCause, RenderRequest,
-        RenderScratch, FRAME_INTERVAL,
+        apply, broadcast, broadcast_effect, broadcast_machine_catalog_changed, dispatch_clipboard,
+        ends_client_writer, flush_graphics, frame_cadence_ready, frame_wait, handle_client,
+        pty_rearm_interval, record_event_render_request, render_clients,
+        shell_workspace_projection, ClientSender, ClientState, Clients, EventRenderSource,
+        FrameSendError, RenderCause, RenderRequest, RenderScratch, FRAME_INTERVAL,
     };
     use crate::app::App;
     use crate::event::{AppEvent, ClientInput};
@@ -2904,6 +3023,129 @@ mod tests {
             ),
             rx,
         )
+    }
+
+    #[test]
+    fn clipboard_success_toast_requires_foreground_receipt() {
+        let _env = crate::persist::test_env("clipboard-receipt");
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let (front, front_rx) = display_client(80, 24, 1);
+        let (other, other_rx) = display_client(80, 24, 2);
+        let mut clients = HashMap::from([(7, front), (8, other)]);
+        let mut next_activity = 3;
+        dispatch_clipboard(&mut clients, Some(7), &mut next_activity, "text".into());
+        let ServerMessage::ClipboardTracked { text, receipt } = front_rx.recv().unwrap() else {
+            panic!("foreground copy must carry a receipt");
+        };
+        assert_eq!(text, "text");
+        assert!(matches!(
+            other_rx.recv().unwrap(),
+            ServerMessage::Clipboard(_)
+        ));
+        assert!(app.toast.is_none());
+
+        let mut foreground = Some(7);
+        let mut interactive_size = (80, 24);
+        assert!(!apply(
+            AppEvent::ClientClipboardSucceeded { id: 8, receipt },
+            &mut app,
+            &mut clients,
+            &mut foreground,
+            &mut interactive_size,
+            &mut next_activity,
+        ));
+        assert!(!apply(
+            AppEvent::ClientClipboardSucceeded {
+                id: 7,
+                receipt: receipt.wrapping_add(1),
+            },
+            &mut app,
+            &mut clients,
+            &mut foreground,
+            &mut interactive_size,
+            &mut next_activity,
+        ));
+        assert!(app.toast.is_none());
+        assert!(apply(
+            AppEvent::ClientClipboardSucceeded { id: 7, receipt },
+            &mut app,
+            &mut clients,
+            &mut foreground,
+            &mut interactive_size,
+            &mut next_activity,
+        ));
+        assert_eq!(
+            app.toast.as_ref().map(|(text, _)| text.as_str()),
+            Some("Copied to Clipboard")
+        );
+    }
+
+    #[test]
+    fn foreground_handoff_discards_commander_draft() {
+        let _env = crate::persist::test_env("commander-handoff");
+        let (tx, _) = mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let (first, _first_rx) = display_client(80, 24, 1);
+        let (second, _second_rx) = display_client(80, 24, 2);
+        let mut clients = HashMap::from([(1, first), (2, second)]);
+        let mut foreground = Some(1);
+        let mut size = (80, 24);
+        let mut activity = 3;
+        app.open_commander();
+        app.commander.as_mut().unwrap().draft = "private".into();
+
+        apply(
+            AppEvent::ClientInput {
+                id: 2,
+                input: ClientInput::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            },
+            &mut app,
+            &mut clients,
+            &mut foreground,
+            &mut size,
+            &mut activity,
+        );
+        assert_eq!(foreground, Some(2));
+        assert!(app.commander.is_none());
+    }
+
+    #[test]
+    fn commander_copy_reaches_only_the_input_client() {
+        let _env = crate::persist::test_env("commander-private-copy");
+        let (tx, _) = mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let (first, first_rx) = display_client(80, 24, 1);
+        let (second, second_rx) = display_client(80, 24, 2);
+        let mut clients = HashMap::from([(1, first), (2, second)]);
+        let mut foreground = Some(1);
+        let mut size = (80, 24);
+        let mut activity = 3;
+        app.open_commander();
+        let commander = app.commander.as_mut().unwrap();
+        commander.draft = "private command".into();
+        commander.cursor = commander.draft.len();
+        for character in ['a', 'c'] {
+            apply(
+                AppEvent::ClientInput {
+                    id: 1,
+                    input: ClientInput::Key(KeyEvent::new(
+                        KeyCode::Char(character),
+                        KeyModifiers::SUPER,
+                    )),
+                },
+                &mut app,
+                &mut clients,
+                &mut foreground,
+                &mut size,
+                &mut activity,
+            );
+        }
+        assert!(matches!(
+            first_rx.try_recv(),
+            Ok(ServerMessage::Clipboard(text)) if text == "private command"
+        ));
+        assert!(second_rx.try_recv().is_err());
     }
 
     #[test]
