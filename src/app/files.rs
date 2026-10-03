@@ -1761,8 +1761,8 @@ mod tests {
         app.handle_file_tree_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
         assert_eq!(app.file_tree.cursor, 3);
         assert_eq!(
-            app.file_tree.scroll, 2,
-            "the two rendered rows keep the last entry in view"
+            app.file_tree.scroll, 3,
+            "the one rendered row keeps the last entry in view"
         );
 
         app.handle_file_tree_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
@@ -3092,7 +3092,7 @@ mod tests {
         assert_eq!(
             first_row_y,
             header_y + crate::ui::DOCK_HEADER_ROWS,
-            "the list starts directly below FILES/DIFF, with no identity row"
+            "the list starts one blank row below FILES/DIFF, with no identity row"
         );
 
         // Click the `src` row (find its rect) and re-render.

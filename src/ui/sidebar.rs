@@ -48,14 +48,17 @@ pub(super) type SidebarHits = (
 type WorkspaceHits = (Vec<(usize, Rect)>, Option<Rect>);
 type AgentHits = (Vec<(PaneId, Rect)>, Vec<(String, Rect)>, Vec<(usize, Rect)>);
 
-/// Rows of sidebar chrome above the dock stack: the session/menu row plus one
-/// blank separator row. Dock layout and divider-drag measurement share this
-/// offset on both sides so titles never touch the top chrome.
-pub(crate) const SIDEBAR_CHROME_ROWS: u16 = 2;
+/// Rows of sidebar chrome above the dock stack: the session/menu row alone.
+/// Dock layout and divider-drag measurement share this offset on both sides.
+/// Personal layout: the first dock title sits directly under the chrome, and
+/// the breathing room lives below each title instead (`DOCK_HEADER_ROWS`).
+/// Upstream (#473) keeps the blank row above the titles instead.
+pub(crate) const SIDEBAR_CHROME_ROWS: u16 = 1;
 
-/// Rows every dock spends on its title. Content follows immediately below it;
-/// the blank separator belongs above the dock stack, not inside each dock.
-pub(crate) const DOCK_HEADER_ROWS: u16 = 1;
+/// Rows every dock spends on its header: the title row plus one blank row that
+/// separates the title from the list, so a title never sits flush against the
+/// rows it labels.
+pub(crate) const DOCK_HEADER_ROWS: u16 = 2;
 
 /// Rows an expanded list item occupies: two content rows, drawn back-to-back.
 const EXPANDED_ROW_STRIDE: u16 = 2;
@@ -1258,7 +1261,7 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_chrome_keeps_one_blank_row_above_dock_titles() {
+    fn sidebar_dock_titles_sit_under_the_chrome_with_a_blank_row_below() {
         let _env = crate::persist::test_env("sidebar-chrome-spacing");
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(120, 40, tx).unwrap();
@@ -1305,16 +1308,16 @@ mod tests {
                     for dock in docks {
                         assert_eq!(
                             dock.y,
-                            chrome_y + 2,
-                            "the title follows the chrome and exactly one blank row"
+                            chrome_y + 1,
+                            "the title sits directly under the chrome"
                         );
                         assert!(
                             (dock.x + 1..dock.right().saturating_sub(1))
-                                .all(|x| { buf.cell((x, chrome_y + 1)).unwrap().symbol() == " " }),
-                            "the separator stays blank on either sidebar"
+                                .all(|x| { buf.cell((x, chrome_y + 2)).unwrap().symbol() == " " }),
+                            "one blank row separates every title from its rows"
                         );
                     }
-                    assert_eq!(app.files_mode_rects[0].1.y, chrome_y + 2);
+                    assert_eq!(app.files_mode_rects[0].1.y, chrome_y + 1);
                     assert_eq!(app.file_tree_rects[0].1.y, chrome_y + 3);
                     assert_eq!(app.settings_icon_rect.unwrap().y, chrome_y);
                     assert_eq!(app.named_session_button_rect.unwrap().y, chrome_y);
