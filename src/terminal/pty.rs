@@ -29,13 +29,14 @@ pub(crate) mod input;
 mod io;
 mod reaper;
 pub(crate) use input::InputSender;
+pub(crate) use reaper::spawn_helper_reaped;
 
 /// Keep each pane's read working set small. Unix amortizes synchronization by
 /// draining several of these chunks under one bounded engine lock.
 const PTY_READ_BUFFER_BYTES: usize = 8 * 1024;
 
 #[cfg(test)]
-use reaper::child_poll_finished;
+use reaper::child_poll_status;
 use reaper::register_child_reaper;
 #[cfg(all(test, unix))]
 use reaper::CHILD_REAPER_STARTS;
@@ -125,6 +126,9 @@ pub struct Pane {
     /// exactly matches the screen snapshot it serialized.
     content_revision: Arc<AtomicU64>,
     observed_title_generation: AtomicU64,
+    /// The session title last announced to event subscribers, so a title that
+    /// only animates its leading icon is not re-announced unchanged.
+    published_title: Mutex<Option<String>>,
     #[cfg(windows)]
     history_maintenance_pending: AtomicBool,
     /// `PtyData` coalescing: set by the reader when it announces new output,
@@ -505,6 +509,7 @@ impl Pane {
             terminal_runtime: Arc::new(Mutex::new(Some(terminal_runtime))),
             content_revision,
             observed_title_generation: AtomicU64::new(0),
+            published_title: Mutex::new(None),
             #[cfg(windows)]
             history_maintenance_pending: AtomicBool::new(true),
             master: Arc::new(Mutex::new(Some(pair.master))),
@@ -692,7 +697,6 @@ impl Pane {
                 }
                 *master.lock().unwrap_or_else(|p| p.into_inner()) = Some(pair.master);
                 let ready_tx = tx.clone();
-                register_child_reaper(id, child, child_exited, tx.clone());
                 *terminal_runtime
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(runtime);
@@ -700,6 +704,9 @@ impl Pane {
                     id,
                     cwd: spawned_cwd,
                 });
+                // A fast child must not publish its reaped status before the
+                // app registers this deferred pane's backend identity.
+                register_child_reaper(id, child, child_exited, tx.clone());
             })
         };
         drop(worker);
@@ -712,6 +719,7 @@ impl Pane {
             terminal_runtime,
             content_revision,
             observed_title_generation: AtomicU64::new(0),
+            published_title: Mutex::new(None),
             #[cfg(windows)]
             history_maintenance_pending: AtomicBool::new(true),
             master,
@@ -780,6 +788,19 @@ impl Pane {
         self.observed_title_generation
             .swap(generation, Ordering::AcqRel)
             != generation
+    }
+
+    /// Record `title` as the session title announced to event subscribers.
+    /// Returns whether it differs from the last one announced.
+    pub(crate) fn note_published_title(&self, title: &Option<String>) -> bool {
+        let Ok(mut published) = self.published_title.lock() else {
+            return true;
+        };
+        if *published == *title {
+            return false;
+        }
+        published.clone_from(title);
+        true
     }
 
     pub(crate) fn take_pending_clipboard(&self) -> Option<String> {
@@ -1282,7 +1303,7 @@ fn read_loop(
     loop {
         match reader.read(&mut buf) {
             Ok(0) | Err(_) => {
-                let _ = tx.send(AppEvent::PtyExit(id));
+                let _ = tx.send(AppEvent::PtyIoClosed(id));
                 break;
             }
             Ok(n) => {
@@ -1440,11 +1461,12 @@ mod reap_tests {
                 !remaining.is_zero(),
                 "natural child exit never woke the reaper"
             );
-            // The PTY actor may publish PtyExit before the child waiter. Keep
+            // The PTY actor may publish PtyIoClosed before the child waiter. Keep
             // waiting until the reaper sets child_exited, which is the behavior
             // this blocked-signal regression is proving.
             match rx.recv_timeout(remaining.min(std::time::Duration::from_millis(50))) {
-                Ok(AppEvent::PtyExit(exited)) if exited == id => {}
+                Ok(AppEvent::PtyIoClosed(exited) | AppEvent::PtyReaped(exited, _))
+                    if exited == id => {}
                 Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(error) => panic!("natural child exit never woke the reaper: {error}"),
             }
@@ -1736,7 +1758,7 @@ mod reap_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_pane_env, child_poll_finished, path_with_server_binary, pty_size, wrap_paste,
+        apply_pane_env, child_poll_status, path_with_server_binary, pty_size, wrap_paste,
         write_input_action, CommandBuilder, InputAction, PaneId,
     };
     use crate::terminal::graphics::HostGraphics;
@@ -1835,13 +1857,13 @@ mod tests {
 
     #[test]
     fn reaper_retries_child_poll_errors() {
-        assert!(!child_poll_finished(Ok(None)));
-        assert!(!child_poll_finished(Err(std::io::Error::other(
-            "temporary poll failure"
-        ))));
-        assert!(child_poll_finished(Ok(Some(
-            portable_pty::ExitStatus::with_exit_code(0)
-        ))));
+        assert!(child_poll_status(Ok(None)).is_none());
+        assert!(child_poll_status(Err(std::io::Error::other("temporary poll failure"))).is_none());
+        assert_eq!(
+            child_poll_status(Ok(Some(portable_pty::ExitStatus::with_exit_code(0))))
+                .map(|status| status.exit_code()),
+            Some(0)
+        );
     }
 
     #[test]

@@ -111,6 +111,15 @@ fn main() -> Result<()> {
     if args.get(1).map(String::as_str) == Some("__automation-worker") {
         std::process::exit(automation::run_worker(&args)?);
     }
+    // A short-lived Unix launcher owns startup cleanup, then exits so a ready
+    // server is no longer a descendant of the client that started it.
+    #[cfg(unix)]
+    if args.get(1).map(String::as_str) == Some("__server-launch-helper") {
+        if args.len() != 2 {
+            return Err(anyhow!("invalid internal server launch invocation"));
+        }
+        return session::run_server_launch_helper().map_err(Into::into);
+    }
     // A server restart initiated inside one of its panes cannot synchronously
     // survive that server closing the pane's PTY. `restart_session_via_helper`
     // launches this private route in a detached process group first.
@@ -208,29 +217,34 @@ pub(crate) fn install_tui_panic_hook() {
     }));
 }
 
-/// Ask the host terminal to report **modified keys unambiguously** (the Kitty
-/// keyboard protocol, via crossterm's `DISAMBIGUATE_ESCAPE_CODES`).
+/// Ask the host terminal to report modified keys unambiguously and preserve
+/// functional-key press/repeat/release phases (Kitty flags 1 and 2).
 ///
-/// Legacy terminal encoding has no room for modifiers on `Enter`: the terminal
-/// sends a bare `CR` for Enter *and* Shift+Enter, so luvus literally cannot tell
-/// them apart and an agent's "new line, don't submit" key never works. With this
-/// pushed, a capable terminal (Ghostty, Kitty, WezTerm, foot, rio, recent
-/// iTerm2) reports `Shift+Enter` as its own key, which `encode_key` forwards to
-/// the pane as `ESC CR`.
+/// Legacy encoding sends a bare `CR` for Enter *and* Shift+Enter, so Luvus
+/// could not tell them apart. Flag 1 keeps them distinct. Flag 2 lets nested
+/// applications that ask Luvus for `REPORT_EVENT_TYPES` receive real repeat and
+/// release events, and lets Luvus stop independent UI actions from repeating
+/// while a key is held. Text-producing keys and legacy Enter/Tab/Backspace stay
+/// ordinary bytes unless a nested application also asks for report-all.
 ///
-/// Only `DISAMBIGUATE_ESCAPE_CODES` is requested — deliberately *not*
-/// `REPORT_EVENT_TYPES` (key-release events) or `REPORT_ALL_KEYS_AS_ESCAPE_CODES`
-/// (which would stop plain text arriving as `Char`). Pushed only when the
-/// terminal advertises support, so nothing is emitted into a terminal that would
-/// print it as garbage, and popped on teardown (including the panic hook).
+/// Flags 4/8/16 are not requested: Crossterm 0.29 does not expose complete
+/// alternate-key or associated-text payloads, and report-all would stop plain
+/// text arriving as `Char`. Pushed only when the terminal advertises support,
+/// so nothing is emitted into a terminal that would print it as garbage, and
+/// popped on teardown (including the panic hook).
 pub(crate) fn push_key_protocol() {
     use ratatui::crossterm::terminal::supports_keyboard_enhancement;
     if matches!(supports_keyboard_enhancement(), Ok(true)) {
         let _ = execute!(
             std::io::stdout(),
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            PushKeyboardEnhancementFlags(host_keyboard_enhancement_flags())
         );
     }
+}
+
+fn host_keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
 }
 
 /// Raise a desktop notification for terminals that show one (iTerm2, etc.).
@@ -1008,50 +1022,63 @@ fn server_running(sock: &Path) -> bool {
     ipc::transport::endpoint_exists(sock, Duration::from_millis(50))
 }
 
+#[cfg(unix)]
 fn spawn_server() -> Result<()> {
-    let exe = std::env::current_exe()?;
-    let mut cmd = Command::new(exe);
-    cmd.arg("server")
-        // The selector was already resolved into LUVUS_SESSION. A parent pane's
-        // injected API socket must not leak into a newly spawned server.
+    session::spawn_session_server(session::active_name().as_deref()).map_err(anyhow::Error::msg)
+}
+
+#[cfg(windows)]
+fn spawn_server() -> Result<()> {
+    use std::os::windows::process::CommandExt;
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .arg("server")
         .env_remove("LUVUS_SOCKET_PATH")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    // Detach so the server survives the client exiting.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP — no console, own group.
-        cmd.creation_flags(0x0000_0008 | 0x0000_0200);
-    }
-    cmd.spawn()?;
+        .stderr(Stdio::null())
+        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP — preserve Windows launch.
+        .creation_flags(0x0000_0008 | 0x0000_0200);
+    command.spawn()?;
     Ok(())
 }
 
 fn wait_for_socket(sock: &Path) -> Result<()> {
-    for _ in 0..100 {
+    wait_for_socket_with_timeout(sock, Duration::from_secs(5))
+}
+
+/// Bound startup readiness without stopping a server that may still restore.
+fn wait_for_socket_with_timeout(sock: &Path, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
         if server_running(sock) {
+            #[cfg(unix)]
+            if server_version_with_timeout(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(100)),
+            )
+            .is_ok()
+            {
+                return Ok(());
+            }
+            #[cfg(windows)]
             return Ok(());
         }
-        thread::sleep(Duration::from_millis(50));
+        thread::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(50)),
+        );
     }
-    Err(anyhow!("luvus server did not start in time"))
+    Err(anyhow!(
+        "luvus server did not become ready in time; it may still be starting, retry when ready"
+    ))
 }
 
 /// `luvus server <start|stop|restart|status>` — manage the background server.
 /// Bare `luvus server` (no subcommand) is the internal headless role that
-/// `spawn_server` launches via setsid; users go through the subcommands.
+/// `spawn_server` launches via the detached launcher; users use subcommands.
 fn server_cmd(args: &[String]) -> Result<()> {
     let Some(command) = args.get(2).map(String::as_str) else {
         return ipc::server::run(); // internal role: run the server in the foreground
@@ -1180,6 +1207,8 @@ fn update_manifest(context: i18n::cli::Context) -> Result<()> {
 fn server_start(context: i18n::cli::Context) -> Result<()> {
     let sock = persist::client_socket_path();
     if server_running(&sock) {
+        #[cfg(unix)]
+        wait_for_socket(&sock)?;
         print_server_card(context, context.text("running"), None, &sock);
         return Ok(());
     }
@@ -1795,6 +1824,15 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
+    fn host_keyboard_protocol_requests_only_crossterm_lossless_flags() {
+        let flags = host_keyboard_enhancement_flags();
+        assert!(flags.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
+        assert!(flags.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES));
+        assert!(!flags.contains(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS));
+        assert!(!flags.contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES));
+    }
+
+    #[test]
     fn stale_server_version_fails_before_binary_attach() {
         let error = report_server_version("0.13.4".to_string()).unwrap_err();
         let message = error.to_string();
@@ -1916,6 +1954,28 @@ mod tests {
         assert!(
             result.is_err(),
             "fail closed rather than attach to a mute loop: {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_wait_rejects_bound_endpoints_without_an_app_response() {
+        let _env = crate::persist::test_env("startup-mute-accept");
+        crate::persist::ensure_session_dir();
+        let client = crate::persist::client_socket_path();
+        let api = crate::persist::socket_path();
+        let _client_listener = crate::ipc::transport::bind(&client).unwrap();
+        let _api_listener = crate::ipc::transport::bind(&api).unwrap();
+        let started = Instant::now();
+        let result = wait_for_socket_with_timeout(&client, Duration::from_millis(120));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("did not become ready"));
+        assert!(
+            server_running(&client),
+            "readiness timeout must not stop the server"
         );
     }
 
@@ -2814,11 +2874,32 @@ mod tests {
         };
 
         // Right-click the first workspace → its context menu opens.
+        app.workspaces[0].branch = Some("feature/demo".into());
         render(&mut app);
         let row = ws_row(&app);
         mouse(&mut app, MouseButton::Right, row.x + 1, row.y);
         assert!(app.ws_menu.is_some(), "right-click opens the menu");
         render(&mut app); // populates item rects
+
+        // The copy rows live one level down. Hovering the Quick Actions row opens
+        // its submenu, which lists Copy Path then Copy Branch.
+        let parent = item_rect(&app, WsMenuItem::QuickActions);
+        app.hover = Some((parent.x + 1, parent.y));
+        render(&mut app);
+        let quick: Vec<WsMenuItem> = app
+            .ws_menu
+            .as_ref()
+            .expect("menu open")
+            .quick_rects
+            .iter()
+            .map(|(item, _)| *item)
+            .collect();
+        assert_eq!(
+            quick,
+            vec![WsMenuItem::CopyPath, WsMenuItem::CopyBranch],
+            "Quick Actions lists Copy Path then Copy Branch"
+        );
+        app.hover = None;
 
         // Pick Rename → the modal opens pre-filled with the current label.
         let rn = item_rect(&app, WsMenuItem::Rename);

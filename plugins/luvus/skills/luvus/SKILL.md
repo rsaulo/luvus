@@ -107,6 +107,9 @@ luvus session delete <name>
 luvus --session <name> pane list
 ```
 
+`pane list` discovers pane IDs across all workspaces and tabs in that session
+without changing focus. Add `--current-tab` to limit the result to the active tab.
+
 `session attach` launches or attaches the TUI. Never run it merely to test
 whether a session exists. `session stop` ends every pane in that named server.
 Before deletion, list sessions once, require the exact stopped name, and obtain
@@ -332,7 +335,9 @@ invalid entry sends nothing, and a closed target returns `send_failed`.
 
 For UHP interactions that must match the inspected screen, use `agent.read`
 with `source:"visible"` and pass its `content_revision` as `if_content_revision`
-together with its `terminal_id` in `agent.keys` params. The revision is a
+together with its `terminal_id` in `agent.keys` params. A `visible` read is the
+live screen, not the pane's scrollback viewport, so it stays valid while someone
+is scrolled back through an earlier turn. The revision is a
 non-negative integer; the terminal ID is exactly 32 lowercase hex characters.
 Both fields are optional as a pair; a one-sided or malformed pair is
 `invalid_request`. A deferred pane has `terminal_id:null` and cannot be fenced.
@@ -453,7 +458,9 @@ surface:
   resolving, removing, applying, or sending a review note. Removing a note and
   sending feedback to an agent require explicit authorization.
 - List worktrees before creating, opening, or removing one. Removal requires
-  explicit authorization and an exact path.
+  explicit authorization and an exact path. If removal returns
+  `worktree_in_use`, report its panes, tasks, and leases. Never retry with
+  `--force` unless the user explicitly authorizes stopping that listed work.
 - Inspect task and lease ownership, dependencies, gates, assignees, and path
   leases before claiming, starting, updating, completing, releasing, deleting,
   or merging. `task merge` is serialized into
@@ -520,7 +527,11 @@ surface:
   workspace scope (the default) or explicit all-workspace scope to inspect
   data without changing the UI,
   `mission.refresh` for an explicit usage refresh, and `mission.open` only to
-  change the visible tab.
+  change the visible tab. Keep the `refresh_id` from `mission.refresh` and read
+  `mission.snapshot` until `refresh.completed_id` reaches it in the same
+  `server_generation`. `usage:null` is unknown, not zero; use `usage_status`
+  and `summary.usage_coverage` to explain partial results. `scope:"all"` stays
+  inside the selected named session.
 - Agent detection is built into Luvus. `luvus integration install` manages
   optional native session-resume hooks and must not be used merely to make an
   agent appear in the sidebar. Install or remove an integration only when the

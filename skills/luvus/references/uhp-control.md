@@ -95,8 +95,13 @@ read current state and reconcile instead of blindly retrying.
 - Agents: `agent.*`, with `agent.prompt` preferred for atomic prompt submission
 - Search, files, Git, and review: `search.*`, `files.*`, `git.*`, and `diff.*`
 - Mission Control: read with `mission.snapshot`, refresh usage on demand with
-  `mission.refresh`, and change the visible UI only with `mission.open`
+  `mission.refresh`, then wait for `refresh.completed_id` to reach its
+  `refresh_id` in the same `server_generation`; `usage_status` explains null
+  usage. Change the visible UI only with `mission.open`
 - Worktrees and orchestration: `worktree.*`, `task.*`, and `lease.*`
+  - `worktree.remove` refuses active agent, task, or lease ownership with
+    `worktree_in_use`. Send `force: true` only with explicit approval to stop
+    the listed work and remove its checkout.
 - Agent scheduling: inspect with `automation.list`, `automation.get`,
   `automation.history`, `automation.preview`, and `automation.health`; mutate
   with `automation.create`, `automation.update`, `automation.enable`,
@@ -202,9 +207,24 @@ prompt. Other agents retain the permissive Unknown-evidence fallback when
 strict is omitted. Inspect the visible screen and use `agent.keys` only for an
 explicitly authorized interaction.
 
+`agent.list` rows and `agent.get` include `agent_session_title`: the agent's
+live conversation title, or `null`. Use it to describe an agent to the user,
+never to target one; titles repeat and change. `name` keeps its meaning as the
+presentation label (a backend label when one exists, otherwise the operator
+alias), so target by pane ID, `terminal_id`, or an alias you set, not by
+`name`. `session` is still the native session ID. Older servers omit the field.
+
+For UHP prompt calls that must reach the same PTY after a possible restart,
+pass the `terminal_id` from `agent.read` or `agent.list` to `agent.prompt` or
+`agent.send`. A mismatch returns `content_revision_conflict` before input is
+queued. Check `uhp.capabilities.concurrency.agent_prompt_terminal_id` first:
+older servers can silently ignore this field on `agent.send`.
+
 For UHP interactions that must match the inspected screen, use `agent.read`
 with `source:"visible"` and pass its `content_revision` as `if_content_revision`
-together with its `terminal_id` in `agent.keys` params. The revision is a
+together with its `terminal_id` in `agent.keys` params. A `visible` read is the
+live screen, not the pane's scrollback viewport, so it stays valid while someone
+is scrolled back through an earlier turn. The revision is a
 non-negative integer; the terminal ID is exactly 32 lowercase hex characters.
 Both fields are optional as a pair; a one-sided or malformed pair is
 `invalid_request`. A deferred pane has `terminal_id:null` and cannot be fenced.

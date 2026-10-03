@@ -143,8 +143,9 @@ tabs:
   tab close [<n>]            close a tab (default: active)
 
 panes / agents:
-  pane list                  list panes and read-only history metrics in the current tab
-  pane split [<id>] [--auto|--right|--down] [--no-focus]   split a pane (default: auto by size, creates a workspace if empty)
+  pane list [--all-tabs]     list panes across every workspace and tab
+  pane list --current-tab    list panes and read-only history metrics in the current tab
+  pane split [<id>] [--auto|--right|--down] [--no-focus] [--cwd <path>]   split a pane (default: auto by size, creates a workspace if empty)
   pane focus <id>            focus a pane (jumps to its workspace/tab)
   pane move [<id>] (--tab <n> | --new-tab)  move a pane within its workspace
   pane run [<id>] <cmd...>   run a command in a pane
@@ -160,9 +161,9 @@ panes / agents:
   agent fork <target> [--name <alias>] [--no-focus]
                              fork a supported agent's session into a sibling pane
   agent name <name>          alias the current agent, same as pane name (--clear to drop)
-  agent prompt <target> <text> [--strict] [--wait] [--until STATE] [--timeout <s>]
+  agent prompt <target> <text> [--terminal-id ID] [--strict] [--wait] [--until STATE] [--timeout <s>]
                              atomically prompt and optionally wait (send is an alias)
-  agent send <target> <text> [--strict] [--wait] [--until STATE] [--timeout <s>]
+  agent send <target> <text> [--terminal-id ID] [--strict] [--wait] [--until STATE] [--timeout <s>]
                              compatibility alias for agent prompt
   agent keys <target> <key>...   send control keys (enter, esc, ctrl+c, up, …)
   agent read <target> [--lines N] [--source visible|recent]   print an agent's output
@@ -273,7 +274,7 @@ worktrees:
   worktree list              list the current repo's worktrees
   worktree create <branch>   create a worktree + workspace for <branch>
   worktree open <path>       open an existing worktree as a workspace
-  worktree remove <path>     remove a worktree (its branch is kept)
+  worktree remove <path> [--force]   remove a worktree (its branch is kept)
 
 orchestration (multiple agents on one project, docs/22):
   task add \"<title>\" [--prompt <text>|--prompt-file <path>] [--paths <glob>...] [--dep <id>...] [--gate <cmd>] [--workspace-id <id>]
@@ -2193,16 +2194,17 @@ fn skill_cmd(rest: &[String], context: crate::i18n::cli::Context) -> Result<i32>
     }
 }
 
-/// `luvus agent prompt <target> <text…> [--strict] [--wait] [--until STATE] [--timeout S]`
+/// `luvus agent prompt <target> <text…> [--terminal-id ID] [--strict] [--wait] [--until STATE] [--timeout S]`
 /// submits and waits as one server-owned operation. `agent send` remains a
 /// compatibility alias.
 fn agent_send_cmd(args: &[String]) -> Result<i32> {
     let target = args.get(3).cloned().ok_or_else(|| {
-        anyhow!("usage: luvus agent prompt <target> <text> [--strict] [--wait] [--until STATE] [--timeout S]")
+        anyhow!("usage: luvus agent prompt <target> <text> [--terminal-id ID] [--strict] [--wait] [--until STATE] [--timeout S]")
     })?;
     let mut text_parts = Vec::new();
     let mut wait = false;
     let mut strict = false;
+    let mut terminal_id = None;
     let mut until = Vec::new();
     let mut timeout = None;
     let mut positional_only = false;
@@ -2226,6 +2228,18 @@ fn agent_send_cmd(args: &[String]) -> Result<i32> {
             "--strict" => {
                 strict = true;
                 index += 1;
+            }
+            "--terminal-id" => {
+                let id = args.get(index + 1).ok_or_else(|| {
+                    anyhow!("--terminal-id requires a 32-character lowercase hex ID")
+                })?;
+                if !crate::terminal::backend::valid_id(id) {
+                    return Err(anyhow!(
+                        "--terminal-id requires a 32-character lowercase hex ID"
+                    ));
+                }
+                terminal_id = Some(id.clone());
+                index += 2;
             }
             "--until" => {
                 until.push(
@@ -2263,6 +2277,9 @@ fn agent_send_cmd(args: &[String]) -> Result<i32> {
     params.insert("wait".into(), json!(wait));
     if strict {
         params.insert("strict".into(), json!(true));
+    }
+    if let Some(terminal_id) = terminal_id {
+        params.insert("terminal_id".into(), json!(terminal_id));
     }
     if !until.is_empty() {
         params.insert("until".into(), json!(until));
@@ -2418,9 +2435,17 @@ pub fn request_attach(pane: &str) -> Result<()> {
 
 /// One request/response over the control socket.
 pub(crate) fn send_request(method: &str, params: Value) -> Result<Value> {
-    let path = crate::persist::cli_socket_path();
-    let mut stream = crate::ipc::transport::connect(&path)
-        .map_err(|error| server_connect_error(&path, error))?;
+    send_request_to(&crate::persist::cli_socket_path(), method, params)
+}
+
+/// One request/response over a specific server's control socket.
+pub(crate) fn send_request_to(
+    path: &std::path::Path,
+    method: &str,
+    params: Value,
+) -> Result<Value> {
+    let mut stream =
+        crate::ipc::transport::connect(path).map_err(|error| server_connect_error(path, error))?;
     let req = json!({ "id": "1", "method": method, "params": params });
     writeln!(stream, "{req}")?;
     let mut reader = BufReader::new(stream);
@@ -3299,6 +3324,27 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
             if args.iter().any(|a| a == "--no-focus") {
                 obj.insert("focus".to_string(), json!(false));
             }
+            for (i, arg) in rest.iter().enumerate() {
+                if arg == "--cwd" {
+                    let raw = rest
+                        .get(i + 1)
+                        .filter(|v| !v.is_empty() && !v.starts_with("--"))
+                        .ok_or_else(|| anyhow!("usage: luvus pane split [<id>] [--cwd <path>]"))?;
+                    if obj.contains_key("cwd") {
+                        return Err(anyhow!("--cwd may be passed only once"));
+                    }
+                    let path = std::path::PathBuf::from(raw);
+                    let path = if path.is_absolute() {
+                        path
+                    } else {
+                        std::env::current_dir()?.join(path)
+                    };
+                    let path = path
+                        .to_str()
+                        .ok_or_else(|| anyhow!("--cwd must be valid UTF-8"))?;
+                    obj.insert("cwd".to_string(), json!(path));
+                }
+            }
             ("pane.split".into(), with_pane(obj))
         }
         ("pane", "focus") => ("pane.focus".into(), with_pane(serde_json::Map::new())),
@@ -3428,7 +3474,12 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
             }
             ("pane.report_event".into(), with_pane(obj))
         }
-        ("pane", "" | "list") => ("pane.list".into(), json!({})),
+        ("pane", "" | "list") => match rest {
+            [] => ("pane.list".into(), json!({"all_tabs": true})),
+            [flag] if flag == "--all-tabs" => ("pane.list".into(), json!({"all_tabs": true})),
+            [flag] if flag == "--current-tab" => ("pane.list".into(), json!({"all_tabs": false})),
+            _ => return Err(anyhow!("usage: luvus pane list [--all-tabs|--current-tab]")),
+        },
         ("pane", other) => {
             return Err(anyhow!(
                 "unknown pane command `{other}`. Try `luvus help pane`."
@@ -3766,7 +3817,31 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
 
         ("worktree", "create") => ("worktree.create".into(), one("branch", arg0())),
         ("worktree", "open") => ("worktree.open".into(), one("path", arg0())),
-        ("worktree", "remove") => ("worktree.remove".into(), one("path", arg0())),
+        ("worktree", "remove") => {
+            let usage = "usage: luvus worktree remove <path> [--force]";
+            let mut path = None;
+            let mut force = false;
+            for value in rest {
+                match value.as_str() {
+                    "--force" if !force => force = true,
+                    "--force" => return Err(anyhow!("--force may be passed only once")),
+                    option if option.starts_with("--") => {
+                        return Err(anyhow!(
+                            "unknown worktree remove option `{option}`. {usage}"
+                        ));
+                    }
+                    value if path.is_none() => path = Some(value.to_string()),
+                    _ => return Err(anyhow!(usage)),
+                }
+            }
+            let path = path.ok_or_else(|| anyhow!(usage))?;
+            let mut params = serde_json::Map::new();
+            params.insert("path".to_string(), json!(path));
+            if force {
+                params.insert("force".to_string(), json!(true));
+            }
+            ("worktree.remove".into(), Value::Object(params))
+        }
         ("worktree", _) => ("worktree.list".into(), json!({})),
 
         ("automation", "create") => {
@@ -4829,8 +4904,18 @@ mod tests {
         let (m, _) = parse(&argv("luvus ping")).unwrap();
         assert_eq!(m, "ping");
 
-        let (m, _) = parse(&argv("luvus pane list")).unwrap();
+        let (m, p) = parse(&argv("luvus pane list")).unwrap();
         assert_eq!(m, "pane.list");
+        assert_eq!(p, json!({"all_tabs": true}));
+        let (m, p) = parse(&argv("luvus pane list --all-tabs")).unwrap();
+        assert_eq!(m, "pane.list");
+        assert_eq!(p, json!({"all_tabs": true}));
+        let (m, p) = parse(&argv("luvus pane list --current-tab")).unwrap();
+        assert_eq!(m, "pane.list");
+        assert_eq!(p, json!({"all_tabs": false}));
+        assert!(parse(&argv("luvus pane list --all-tabs --all-tabs")).is_err());
+        assert!(parse(&argv("luvus pane list --all-tabs --current-tab")).is_err());
+        assert!(parse(&argv("luvus pane list --unknown")).is_err());
 
         let (m, p) = parse(&argv("luvus pane split --down")).unwrap();
         assert_eq!(m, "pane.split");
@@ -4863,6 +4948,83 @@ mod tests {
         assert_eq!(m, "tab.new");
         let (m, _) = parse(&argv("luvus agent list")).unwrap();
         assert_eq!(m, "agent.list");
+    }
+
+    #[test]
+    fn pane_split_cwd_resolves_paths_and_keeps_existing_options() {
+        let absolute = std::env::current_dir().unwrap();
+        let args = vec![
+            "luvus".into(),
+            "pane".into(),
+            "split".into(),
+            "3".into(),
+            "--cwd".into(),
+            absolute.to_string_lossy().into_owned(),
+            "--right".into(),
+            "--no-focus".into(),
+        ];
+        let (method, params) = parse(&args).unwrap();
+        assert_eq!(method, "pane.split");
+        assert_eq!(
+            params,
+            json!({
+                "pane": "3", "cwd": absolute, "direction": "right", "focus": false,
+            })
+        );
+
+        let (_, params) = parse(&argv("luvus pane split --cwd nested --auto")).unwrap();
+        assert_eq!(params["cwd"], json!(absolute.join("nested")));
+        assert_eq!(params["direction"], "auto");
+        for command in ["luvus pane split --cwd", "luvus pane split --cwd --down"] {
+            assert!(parse(&argv(command))
+                .unwrap_err()
+                .to_string()
+                .contains("usage:"));
+        }
+        assert!(parse(&argv("luvus pane split --cwd one --cwd two")).is_err());
+        let empty = vec![
+            "luvus".into(),
+            "pane".into(),
+            "split".into(),
+            "--cwd".into(),
+            String::new(),
+        ];
+        assert!(parse(&empty).unwrap_err().to_string().contains("usage:"));
+    }
+
+    // This filesystem fixture needs non-UTF-8 filenames, which APFS rejects.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pane_split_cwd_reports_non_utf8_working_directory() {
+        use std::os::unix::ffi::OsStringExt;
+
+        const CHILD: &str = "LUVUS_TEST_SPLIT_NON_UTF8_CWD";
+        if std::env::var_os(CHILD).is_some() {
+            let error = parse(&argv("luvus pane split --cwd nested")).unwrap_err();
+            assert_eq!(error.to_string(), "--cwd must be valid UTF-8");
+            return;
+        }
+
+        // A subprocess exercises current_dir without changing the test suite's cwd.
+        let _env = crate::persist::test_env("split-non-utf8-cwd");
+        let cwd =
+            crate::persist::config_dir().join(std::ffi::OsString::from_vec(b"cwd-\xff".to_vec()));
+        fs::create_dir_all(&cwd).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "cli::tests::pane_split_cwd_reports_non_utf8_working_directory",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -5653,6 +5815,8 @@ mod tests {
             ("luvus agent prompt codex review --wait", json!({"target":"codex","text":"review","wait":true})),
             ("luvus agent prompt claude --strict review", json!({"target":"claude","text":"review","wait":false,"strict":true})),
             ("luvus agent send reviewer --strict review this", json!({"target":"reviewer","text":"review this","wait":false,"strict":true})),
+            ("luvus agent prompt 7 review --terminal-id 0123456789abcdef0123456789abcdef", json!({"target":"7","text":"review","wait":false,"terminal_id":"0123456789abcdef0123456789abcdef"})),
+            ("luvus agent send 7 --terminal-id 0123456789abcdef0123456789abcdef review", json!({"target":"7","text":"review","wait":false,"terminal_id":"0123456789abcdef0123456789abcdef"})),
             ("luvus agent send 7 review --wait --until done --timeout 0.5", json!({"target":"7","text":"review","wait":true,"until":["done"],"timeout_s":0.5})),
             ("luvus agent prompt 7 --wait --until idle --until working --until blocked --until done review --timeout 3600", json!({"target":"7","text":"review","wait":true,"until":["idle","working","blocked","done"],"timeout_s":3600.0})),
             ("luvus agent send 7 --wait --until idle --until idle --timeout 0 review", json!({"target":"7","text":"review","wait":true,"until":["idle","idle"],"timeout_s":0.0})),
@@ -5697,6 +5861,12 @@ mod tests {
             assert_eq!(agent_send_cmd(&argv(invocation)).unwrap(), exit);
         }
         server.join().unwrap();
+        for invocation in [
+            "luvus agent prompt 7 review --terminal-id BAD",
+            "luvus agent send 7 review --terminal-id",
+        ] {
+            assert!(agent_send_cmd(&argv(invocation)).is_err(), "{invocation}");
+        }
     }
 
     #[test]
@@ -6134,6 +6304,14 @@ mod tests {
         let (m, p) = parse(&argv("luvus worktree remove /tmp/wt")).unwrap();
         assert_eq!(m, "worktree.remove");
         assert_eq!(p.get("path").and_then(|v| v.as_str()), Some("/tmp/wt"));
+        assert_eq!(p.get("force"), None);
+        let (m, p) = parse(&argv("luvus worktree remove --force /tmp/wt")).unwrap();
+        assert_eq!(m, "worktree.remove");
+        assert_eq!(p.get("path").and_then(|v| v.as_str()), Some("/tmp/wt"));
+        assert_eq!(p.get("force").and_then(Value::as_bool), Some(true));
+        assert!(parse(&argv("luvus worktree remove")).is_err());
+        assert!(parse(&argv("luvus worktree remove /tmp/a /tmp/b")).is_err());
+        assert!(parse(&argv("luvus worktree remove /tmp/wt --unknown")).is_err());
     }
 
     #[test]

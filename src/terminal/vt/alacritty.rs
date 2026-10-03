@@ -981,6 +981,56 @@ impl VtEngine for AlacrittyEngine {
         }
     }
 
+    fn opencode_composer_ready(&self) -> bool {
+        let grid = self.term.grid();
+        if grid.display_offset() != 0 || !self.term.mode().contains(TermMode::SHOW_CURSOR) {
+            return false;
+        }
+        let rows = grid.screen_lines();
+        let cols = grid.columns();
+        if rows < 5 || cols < 16 {
+            return false;
+        }
+        let cursor = grid.cursor.point;
+        let row = cursor.line.0.max(0) as usize;
+        let col = cursor.column.0;
+        if row >= rows || col < 3 || col >= cols - 1 {
+            return false;
+        }
+        let symbol = |row: usize, col: usize| grid[Line(row as i32)][Column(col)].c;
+
+        // OpenCode draws a left rail beside the editable area and a wide
+        // lower edge. The cursor must be *inside* that live box: a welcome
+        // screen, old transcript, or partially painted frame is not enough.
+        for rail in (0..col).rev() {
+            if symbol(row, rail) != '┃' || col < rail + 2 {
+                continue;
+            }
+            let mut top = row;
+            while top > 0 && symbol(top - 1, rail) == '┃' {
+                top -= 1;
+            }
+            let mut bottom = row;
+            while bottom + 1 < rows && symbol(bottom + 1, rail) == '┃' {
+                bottom += 1;
+            }
+            if bottom - top < 2 || bottom + 1 >= rows {
+                continue;
+            }
+            let edge = bottom + 1;
+            let underline = (rail + 1..cols)
+                .take_while(|&col| symbol(edge, col) == '▀')
+                .count();
+            // A blank row can be an unfinished redraw, even when a transparent
+            // theme would also render a blank edge. Fail closed without a
+            // measured lower border, and keep the cursor inside that border.
+            if symbol(edge, rail) == '╹' && underline >= 16 && col <= rail + underline {
+                return true;
+            }
+        }
+        false
+    }
+
     fn for_each_cell(&self, f: &mut dyn FnMut(u16, u16, &str, RenderCell)) {
         // `display_iter` walks the *displayed* region, whose lines are *negative*
         // once scrolled into history (it starts at `Line(-display_offset)`).
@@ -1288,10 +1338,10 @@ impl VtEngine for AlacrittyEngine {
         selected.join("\n")
     }
 
+    #[cfg(test)]
     fn visible_rows(&self) -> Vec<String> {
         // Same offset shift as `for_each_cell` — these are the rows the user can
-        // see, so a selection made while scrolled back must copy the history
-        // text, not come back empty.
+        // see, so a scrolled viewport reports the history text it is showing.
         let grid = self.term.grid();
         let rows = grid.screen_lines();
         let offset = grid.display_offset() as i32;
@@ -1307,6 +1357,33 @@ impl VtEngine for AlacrittyEngine {
             lines[r as usize].push(cell_as_text(indexed.cell).0);
         }
         lines
+    }
+
+    fn screen_rows(&self) -> Vec<String> {
+        // Index by `Line` rather than walking `display_iter`: line indexing is
+        // relative to the live screen (`Storage::compute_index` ignores
+        // `display_offset`), so this frame is what the child last painted, not
+        // wherever the user has scrolled to. Same rule as `detection_text`.
+        let grid = self.term.grid();
+        let rows = grid.screen_lines();
+        let cols = grid.columns();
+        (0..rows)
+            .map(|r| {
+                let row = &grid[Line(r as i32)];
+                let mut line = String::with_capacity(cols);
+                for c in 0..cols {
+                    let cell = &row[Column(c)];
+                    if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                        continue;
+                    }
+                    line.push(if cell.c == '\0' { ' ' } else { cell.c });
+                    if let Some(zerowidth) = cell.zerowidth() {
+                        line.extend(zerowidth);
+                    }
+                }
+                line
+            })
+            .collect()
     }
 
     fn visible_rows_aligned(&self) -> AlignedRows {
@@ -2312,6 +2389,31 @@ mod tests {
             damage.rows[0].hyperlinks[0].uri,
             "file:///repo/server/task.mjs"
         );
+    }
+
+    /// `screen_rows` reads the live frame; `visible_rows` follows the user.
+    #[test]
+    fn screen_rows_ignore_the_scrollback_viewport() {
+        let (tx, _rx) = channel();
+        let mut engine = AlacrittyEngine::new(24, 3, tx, budget_for_rows(24, 40));
+        engine.advance(b"old prompt\r\n");
+        for i in 0..10 {
+            engine.advance(format!("line {i}\r\n").as_bytes());
+        }
+        engine.advance(b"live prompt");
+
+        engine.scroll(10);
+        assert!(
+            engine.scroll_offset() > 0,
+            "precondition: the viewport is scrolled into history"
+        );
+        assert!(
+            engine.visible_rows().join("\n").contains("old prompt"),
+            "precondition: the user is looking at the old frame"
+        );
+        let screen = engine.screen_rows().join("\n");
+        assert!(screen.contains("live prompt"), "{screen}");
+        assert!(!screen.contains("old prompt"), "{screen}");
     }
 
     #[test]
@@ -4101,6 +4203,71 @@ mod tests {
             e.claude_composer_evidence(),
             ClaudeComposerEvidence::Ambiguous
         );
+    }
+
+    #[test]
+    fn opencode_composer_requires_live_cursor_and_complete_box() {
+        let (tx, _rx) = channel();
+        let mut e = AlacrittyEngine::new(40, 20, tx, budget_for_rows(40, 2_000));
+        e.advance(b"\x1b[?1049h\x1b[2J\x1b[11;8H");
+        assert!(!e.opencode_composer_ready(), "startup is blank");
+
+        for row in 10..=13 {
+            e.advance(format!("\x1b[{row};5H┃").as_bytes());
+        }
+        e.advance(b"\x1b[11;8H");
+        assert!(!e.opencode_composer_ready(), "box is incomplete");
+
+        e.advance(format!("\x1b[14;5H╹{}\x1b[11;8H", "▀".repeat(35)).as_bytes());
+        assert!(e.opencode_composer_ready(), "empty live composer");
+
+        e.advance(b"\x1b[11;8Hprefilled prompt\x1b[11;23H");
+        assert!(e.opencode_composer_ready(), "prefilled live composer");
+
+        e.advance(b"\x1b[?25l");
+        assert!(!e.opencode_composer_ready(), "hidden cursor during redraw");
+        e.advance(b"\x1b[?25h");
+
+        e.advance(b"\x1b[2;2H");
+        assert!(!e.opencode_composer_ready(), "old box is not live");
+    }
+
+    #[test]
+    fn opencode_composer_rejects_a_short_border() {
+        let (tx, _rx) = channel();
+        let mut e = AlacrittyEngine::new(40, 20, tx, budget_for_rows(40, 2_000));
+        e.advance("\x1b[10;5H┃\x1b[11;5H┃\x1b[12;5H┃\x1b[13;5H┃\x1b[14;5H╹▀▀\x1b[11;8H".as_bytes());
+        assert!(!e.opencode_composer_ready());
+    }
+
+    #[test]
+    fn opencode_composer_accepts_a_centered_box_in_a_wide_pty() {
+        let (tx, _rx) = channel();
+        let mut e = AlacrittyEngine::new(120, 32, tx, budget_for_rows(120, 2_000));
+        // Captured from OpenCode 2.0.3 at 120 columns. The prompt is centered,
+        // not anchored to the first few columns of the terminal.
+        for row in 18..=21 {
+            e.advance(format!("\x1b[{row};23H┃").as_bytes());
+        }
+        e.advance(format!("\x1b[22;23H╹{}\x1b[19;26H", "▀".repeat(80)).as_bytes());
+        assert!(e.opencode_composer_ready());
+
+        e.advance(b"\x1b[19;111H");
+        assert!(!e.opencode_composer_ready(), "cursor beyond the lower edge");
+    }
+
+    #[test]
+    fn opencode_composer_rejects_an_unproven_blank_edge() {
+        let (tx, _rx) = channel();
+        let mut e = AlacrittyEngine::new(80, 24, tx, budget_for_rows(80, 2_000));
+        for row in 12..=15 {
+            e.advance(format!("\x1b[{row};12H┃").as_bytes());
+        }
+        e.advance(b"\x1b[13;15H");
+        assert!(!e.opencode_composer_ready(), "undrawn edge is not proof");
+
+        e.advance(b"\x1b[16;13Hpartial edge\x1b[13;15H");
+        assert!(!e.opencode_composer_ready());
     }
 
     #[test]

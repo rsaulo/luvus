@@ -1432,6 +1432,17 @@ static HELP: &[Translation] = &[
         "현재 탭의 패널과 읽기 전용 기록 지표 나열"
     ),
     tr!(
+        "list panes across every workspace and tab",
+        "listar paneles de todos los espacios de trabajo y pestañas",
+        "listar painéis de todos os espaços de trabalho e abas",
+        "lister les volets de tous les espaces de travail et onglets",
+        "Bereiche aus allen Arbeitsbereichen und Tabs auflisten",
+        "daftar panel di semua ruang kerja dan tab",
+        "列出所有工作区和标签页中的窗格",
+        "すべてのワークスペースとタブのペインを一覧表示",
+        "모든 작업 공간과 탭의 패널 나열"
+    ),
+    tr!(
         "split a pane (default: auto by size, creates a workspace if empty)",
         "dividir un panel (predeterminado: automático según el tamaño, crea un espacio de trabajo si está vacío)",
         "dividir um painel (padrão: automático pelo tamanho, cria um espaço de trabalho se estiver vazio)",
@@ -2845,6 +2856,28 @@ static HELP: &[Translation] = &[
 /// labels such as `name` can never be mistaken for a help-row description.
 static TEXT: &[Translation] = &[
     tr!(
+        "--cwd may be passed only once",
+        "--cwd solo puede especificarse una vez",
+        "--cwd só pode ser especificado uma vez",
+        "--cwd ne peut être spécifié qu'une seule fois",
+        "--cwd darf nur einmal angegeben werden",
+        "--cwd hanya boleh diberikan sekali",
+        "--cwd 只能指定一次",
+        "--cwd は一度だけ指定できます",
+        "--cwd는 한 번만 지정할 수 있습니다"
+    ),
+    tr!(
+        "--cwd must be valid UTF-8",
+        "--cwd debe ser UTF-8 válido",
+        "--cwd deve ser UTF-8 válido",
+        "--cwd doit être un UTF-8 valide",
+        "--cwd muss gültiges UTF-8 sein",
+        "--cwd harus berupa UTF-8 yang valid",
+        "--cwd 必须是有效的 UTF-8",
+        "--cwd は有効な UTF-8 である必要があります",
+        "--cwd는 유효한 UTF-8이어야 합니다"
+    ),
+    tr!(
         "exact search query must be at most 4096 bytes",
         "la búsqueda exacta no puede superar los 4096 bytes",
         "a busca exata não pode exceder 4096 bytes",
@@ -3257,6 +3290,32 @@ mod tests {
             assert_eq!(diagnostic(source, language), text(source, language));
             if language != Language::En {
                 assert_ne!(diagnostic(source, language), source);
+            }
+        }
+    }
+
+    #[test]
+    fn pane_split_cwd_diagnostics_are_localized() {
+        for source in ["--cwd may be passed only once", "--cwd must be valid UTF-8"] {
+            for code in crate::i18n::LANGS {
+                let language = Language::from_code(code);
+                let translated = diagnostic(source, language);
+                assert!(translated.contains("--cwd"));
+                if source.contains("UTF-8") {
+                    assert!(translated.contains("UTF-8"));
+                }
+                if language != Language::En {
+                    assert_ne!(translated, source, "{code} kept the English diagnostic");
+                }
+            }
+        }
+        let usage = "usage: luvus pane split [<id>] [--cwd <path>]";
+        for code in crate::i18n::LANGS {
+            let language = Language::from_code(code);
+            let translated = diagnostic(usage, language);
+            assert!(translated.contains("luvus pane split [<id>] [--cwd <path>]"));
+            if language != Language::En {
+                assert_ne!(translated, usage, "{code} kept the English usage label");
             }
         }
     }

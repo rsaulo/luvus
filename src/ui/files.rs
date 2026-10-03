@@ -77,8 +77,7 @@ pub(super) fn draw_files_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t
 
     // Workspace and branch are already present in Luvus chrome, so the dock
     // spends no row repeating that identity and DIFF progress. Content starts
-    // one blank row under the selector, the gap every dock keeps between its
-    // title and its rows (`DOCK_HEADER_ROWS`).
+    // immediately below the selector, like the other dock lists.
     let mut list_top = area.y + crate::ui::DOCK_HEADER_ROWS;
     let mut cap = area.height.saturating_sub(crate::ui::DOCK_HEADER_ROWS) as usize;
     if app.files_mode == crate::diff::FilesMode::Diff {
@@ -88,7 +87,7 @@ pub(super) fn draw_files_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t
     // A folder never visited yet has no listing until the worker read lands.
     // Say so instead of leaving a blank dock that reads as an empty folder;
     // a revisited folder renders its cached listing immediately instead.
-    if app.file_tree.filter.is_none() && !app.file_tree.root_loaded() {
+    if !app.file_tree.root_loaded() && app.file_tree.filter.is_none() {
         line_at(
             f,
             list_top,

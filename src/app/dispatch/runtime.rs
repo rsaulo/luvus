@@ -145,6 +145,14 @@ impl App {
         if let Some(exp) = self.bar.notifications.iter().map(|n| n.expires_at).min() {
             consider(exp, true);
         }
+        if let Some(exp) = self
+            .pending_pty_exits
+            .values()
+            .map(|pending| pending.deadline)
+            .min()
+        {
+            consider(exp, true);
+        }
 
         if self.detection_work_pending(now) {
             consider(self.last_detect_at + DETECTION_INTERVAL, true);
@@ -411,7 +419,8 @@ impl App {
 
     pub(crate) fn detect_tick_with(&mut self, now: Instant, clients_attached: bool) -> bool {
         self.runtime_clients_attached = clients_attached;
-        let repaired_location = self.repair_active_location();
+        let exited = self.tick_pty_exits(now);
+        let repaired_location = self.repair_active_location() || exited;
         self.schedule_config_save(now);
         self.schedule_automation_save(now);
         // No node open (docs/43 §3.3 — the session was closed). Closing the last
@@ -419,24 +428,29 @@ impl App {
         // `layout()` below would index an empty `workspaces`. The server keeps
         // ticking here with no clients attached, so this is a live path, not a
         // theoretical one.
-        if self.workspaces.is_empty() || self.workspaces[self.active_ws].tabs.is_empty() {
-            return repaired_location;
-        }
-        let repaired_location = self.follow_active_file_root() || repaired_location;
-        self.schedule_runtime_scans(now, clients_attached);
+        let has_active_workspace =
+            !self.workspaces.is_empty() && !self.workspaces[self.active_ws].tabs.is_empty();
+        let repaired_location = if has_active_workspace {
+            let repaired_location = self.follow_active_file_root() || repaired_location;
+            self.schedule_runtime_scans(now, clients_attached);
+            repaired_location
+        } else {
+            repaired_location
+        };
         // Mission Control usage is demand-driven. Opening/focusing the dashboard,
         // changing scope, or pressing/clicking refresh queues one worker scan;
         // merely retaining a hidden mission tab performs no usage IO.
         self.sync_mission_usage_visibility();
-        if self.mission_usage_requested.is_some() && !self.usage_scan_inflight {
+        if self.mission_usage_requested.is_some() && self.mission_usage_inflight.is_none() {
             let request = self
                 .mission_usage_requested
                 .take()
                 .expect("usage request checked above");
-            self.usage_scan_inflight = true;
-            let targets = self.mission_usage_targets_for(request.scope, request.workspace);
+            self.mission_usage_requested = self.mission_usage_queued.pop_front();
+            self.mission_usage_inflight = Some(request.clone());
+            let workspace = self.mission_usage_workspace(&request);
+            let targets = self.mission_usage_targets_for(request.scope, workspace);
             let scanned = targets.keys().cloned().collect::<Vec<_>>();
-            let scope = request.scope;
             let overrides = self.config.mission_pricing.clone();
             // Previous results let an explicit refresh reuse unchanged transcripts:
             // one stat per idle session, with no read or parse.
@@ -484,13 +498,16 @@ impl App {
                     }
                 }
                 let _ = tx.send(AppEvent::UsageScanned {
-                    scope,
+                    request,
                     scanned,
                     usage,
                     mtimes,
                     report_owned,
                 });
             });
+        }
+        if !has_active_workspace {
+            return repaired_location;
         }
         // The per-pane classification below locks each pane's VT engine + scans its
         // grid; agent state (blocked/working/done) is human-paced, so ~100ms is
@@ -657,7 +674,7 @@ impl App {
                 .as_ref()
                 .and_then(|(_, _, _, composer_ready)| *composer_ready);
             if let Some(s) = self.status.get_mut(&id) {
-                if let Some((generation, title, bottom, _)) = inspected {
+                if let Some((generation, title, bottom, composer_ready)) = inspected {
                     if audit_only {
                         self.detection_audit_recoveries =
                             self.detection_audit_recoveries.saturating_add(1);
@@ -666,17 +683,24 @@ impl App {
                     presentation_metadata_changed |= s.detected_title != title;
                     s.detected_title = title;
                     s.detected_bottom = bottom;
+                    s.detected_composer_ready = composer_ready;
                     s.force_detect = false;
                     self.detection_extractions = self.detection_extractions.saturating_add(1);
                 } else {
                     self.detection_skips = self.detection_skips.saturating_add(1);
                 }
             }
-            let (title, bottom) = self
+            let (title, bottom, detected_composer_ready) = self
                 .status
                 .get(&id)
-                .map(|s| (s.detected_title.clone(), s.detected_bottom.clone()))
-                .unwrap_or_else(|| (None, Arc::from("")));
+                .map(|s| {
+                    (
+                        s.detected_title.clone(),
+                        s.detected_bottom.clone(),
+                        s.detected_composer_ready,
+                    )
+                })
+                .unwrap_or_else(|| (None, Arc::from(""), None));
             let base = pane.command.as_str();
             let recent = self
                 .status
@@ -710,7 +734,7 @@ impl App {
                     rule_priority: None,
                     rule_region: None,
                 },
-                None => detect::classify(
+                None => detect::classify_with_composer(
                     title.as_deref(),
                     &bottom,
                     recent,
@@ -719,6 +743,10 @@ impl App {
                     known,
                     running,
                     &self.manifests,
+                    // Only Claude's own probe can vouch for Claude's screen.
+                    composer_agent
+                        .filter(|agent| agent.eq_ignore_ascii_case("claude"))
+                        .and(detected_composer_ready),
                 ),
             };
 

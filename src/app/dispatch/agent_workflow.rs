@@ -528,14 +528,22 @@ impl App {
         } else {
             engine.detection_text(rows)
         };
-        let raw =
-            detect::prompt_evidence(engine.title().as_deref(), &bottom, agent, &self.manifests);
+        let composer = positive_evidence_required
+            .then(|| {
+                detect::live_composer_ready(agent, &*engine, status.claude_prompt_semantic_ready)
+            })
+            .flatten();
+        let raw = detect::prompt_evidence_with_composer(
+            engine.title().as_deref(),
+            &bottom,
+            agent,
+            &self.manifests,
+            composer,
+        );
         let evidence = if raw == detect::PromptEvidence::Blocked {
             raw
         } else if positive_evidence_required {
-            if detect::live_composer_ready(agent, &*engine, status.claude_prompt_semantic_ready)
-                == Some(true)
-            {
+            if composer == Some(true) {
                 detect::PromptEvidence::Ready
             } else {
                 detect::PromptEvidence::Unknown
@@ -565,7 +573,15 @@ impl App {
         }
         if let Err((code, message)) = reject_api_fields(
             &p,
-            &["target", "text", "wait", "until", "timeout_s", "strict"],
+            &[
+                "target",
+                "text",
+                "wait",
+                "until",
+                "timeout_s",
+                "strict",
+                "terminal_id",
+            ],
         ) {
             fail(&code, message);
             return;
@@ -649,15 +665,19 @@ impl App {
                 return;
             }
         }
+        let Some(target) = self.panes.get(&pane) else {
+            fail("not_found", "pane not found".to_string());
+            return;
+        };
+        if let Err((code, message)) = check_agent_terminal_id(&p, target) {
+            fail(&code, message);
+            return;
+        }
         if !self.agent_prompt_is_ready(pane, strict) {
             let (code, message) = agent_prompt_not_ready_error();
             fail(&code, message);
             return;
         }
-        let Some(target) = self.panes.get(&pane) else {
-            fail("not_found", "pane not found".to_string());
-            return;
-        };
         let baseline_revision = target.content_revision();
         if let Err(message) = target.try_submit_text(text) {
             fail("send_failed", message);

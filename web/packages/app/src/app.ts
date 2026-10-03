@@ -1,9 +1,13 @@
 import { BridgeClient, BridgeError, LiveSession, type PaneSnapshot, type SessionSnapshot } from "@luvus/uhp-client";
 import { button, element } from "./dom.js";
-import { dashboardAgents, displayText } from "./dashboard-agents.js";
+import { agentCardTitle, dashboardAgents, displayText } from "./dashboard-agents.js";
+import { accessProblem, pairingCredential, parsePairingInput, type SentCredential } from "./pairing.js";
 import { pairingQrDataUrl } from "./pairing-qr.js";
+import { RenderScheduler } from "./render-scheduler.js";
 import { supportsFileUpload } from "./terminal-capabilities.js";
-import { TerminalView, type TerminalPaneOption } from "./terminal-view.js";
+import { terminalPaneOptions, type TerminalPaneOption } from "./terminal-pane-options.js";
+import { TerminalView } from "./terminal-view.js";
+import { markFieldSaved, rebuildPreservingView } from "./view-state.js";
 
 const TICKET_KEY = "luvus.web.ticket";
 
@@ -12,6 +16,8 @@ type DeviceStatus = {
   paired_devices: number;
   pending_pairings: number;
   max_devices: number;
+  /** The operator's --max-devices; a browser may not choose more. */
+  limit_ceiling?: number;
   public_url: string | null;
 };
 
@@ -42,34 +48,68 @@ export class WebApp {
   #sessionPanelOpen = false;
   #sessionLoading = false;
   #showShells = false;
+  /** This tab's own pairing code, from its link or pasted on the access screen. */
+  #tabCode: string | undefined;
+  /** What this tab last presented, so a rejection can be explained truthfully. */
+  #sent: SentCredential = { ticket: false, code: false };
+  #pairError: string | undefined;
+  /** Redraws caused by live updates, as opposed to the person's own actions. */
+  readonly #renders = new RenderScheduler(() => this.#renderNow());
 
   constructor(private readonly root: HTMLElement) {
-    const pair = consumePairingFragment();
-    if (pair) sessionStorage.removeItem(TICKET_KEY);
+    // Hold live redraws while a pointer is pressed, so the pressed element
+    // is still there when it is released and the click is delivered.
+    root.addEventListener("pointerdown", (event) => this.#renders.hold(event.pointerId), true);
+    for (const type of ["pointerup", "pointercancel"] as const) {
+      window.addEventListener(type, (event) => this.#renders.release(event.pointerId), true);
+    }
+    // A mouse that moves with no button pressed was released where this page
+    // could not see it, for example outside the window.
+    window.addEventListener("pointermove", (event) => {
+      if (event.buttons === 0) this.#renders.release(event.pointerId);
+    }, true);
+    window.addEventListener("blur", () => this.#renders.releaseAll());
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) this.#renders.releaseAll();
+    });
+    this.#tabCode = consumePairingFragment();
     const scheme = location.protocol === "https:" ? "wss:" : "ws:";
-    this.#bridge = new BridgeClient(`${scheme}//${location.host}/bridge`, () => ({
-      ...(sessionStorage.getItem(TICKET_KEY) ? { ticket: sessionStorage.getItem(TICKET_KEY)! } : {}),
-      ...(!sessionStorage.getItem(TICKET_KEY) && pair ? { code: pair } : {}),
-    }), (ticket) => sessionStorage.setItem(TICKET_KEY, ticket));
+    this.#bridge = new BridgeClient(`${scheme}//${location.host}/bridge`, () => {
+      const credential = pairingCredential(sessionStorage.getItem(TICKET_KEY), this.#tabCode);
+      this.#sent = { ticket: Boolean(credential.ticket), code: Boolean(credential.code) };
+      return credential;
+    }, (ticket) => {
+      sessionStorage.setItem(TICKET_KEY, ticket);
+      // The code was spent to issue this ticket.
+      this.#tabCode = undefined;
+    });
     this.#bridge.addEventListener("devices", (event) => {
       try {
         this.#devices = asDeviceStatus((event as CustomEvent).detail);
         if (this.#pairingCode) this.#pairingUrl = this.#pairingLink(this.#pairingCode);
-        this.#render();
+        this.#renders.request();
       } catch (error) {
         this.#showError(error);
       }
     });
     this.#session = new LiveSession(this.#bridge);
     this.#session.addEventListener("state", () => {
-      this.#render();
+      if (this.#session.state === "ready") this.#tabCode = undefined; // authorized; no longer needed
+      if (this.#session.state === "expired" && this.#terminal) {
+        // Access ended while a terminal was open. Leave it, or the terminal
+        // would sit on a dead connection with no way forward.
+        this.#terminal.destroy();
+        this.#terminal = undefined;
+      }
+      this.#renders.request();
       if (this.#session.state === "ready" && !this.#devices) void this.#refreshDevices();
     });
     this.#session.addEventListener("snapshot", () => {
       const snapshot = this.#session.snapshot;
       if (snapshot) this.#terminal?.updateSnapshot(snapshot);
-      this.#render();
+      this.#renders.request();
     });
+    this.#session.addEventListener("titles", (event) => this.#updateTitles((event as CustomEvent<string[]>).detail));
   }
 
   async start(): Promise<void> {
@@ -77,29 +117,115 @@ export class WebApp {
     try {
       await this.#session.start();
     } catch (error) {
-      this.#showError(error);
+      // The access screen already explains a rejection.
+      if (this.#session.state !== "expired") this.#showError(error);
     }
   }
 
+  /**
+   * Redraw now, unless a pointer is pressed on the page: then the redraw is
+   * queued until release, so a request that completes mid-press (device or
+   * session lists, for example) cannot replace the pressed element.
+   */
   #render(): void {
+    if (this.#renders.holding) this.#renders.request();
+    else this.#renderNow();
+  }
+
+  #renderNow(): void {
     if (this.#terminal) return;
     const snapshot = this.#session.snapshot;
-    this.root.replaceChildren(
+    // Without authority nothing on the dashboard can act, so show the access
+    // screen instead of a stale dashboard or a loading state that never ends.
+    const expired = this.#session.state === "expired";
+    rebuildPreservingView(this.root, () => this.root.replaceChildren(
       element("div", { className: "shell" },
-        snapshot
-          ? this.#dashboard(snapshot)
-          : element("div", { className: "dashboard loading-dashboard" }, this.#missionDock(false), this.#connecting()),
-        snapshot && this.#devicePanelOpen ? this.#devicePanel() : undefined,
+        expired
+          ? element("div", { className: "dashboard loading-dashboard" }, this.#accessScreen())
+          : snapshot
+            ? this.#dashboard(snapshot)
+            : element("div", { className: "dashboard loading-dashboard" }, this.#missionDock(false), this.#connecting()),
+        !expired && snapshot && this.#devicePanelOpen ? this.#devicePanel() : undefined,
       ),
-    );
+    ));
+  }
+
+  /** Update changed agent titles in place, leaving every other element as it is. */
+  #updateTitles(paneIds: string[]): void {
+    const snapshot = this.#session.snapshot;
+    if (!snapshot) return;
+    if (this.#terminal) {
+      this.#terminal.updateTitles(paneIds);
+      return;
+    }
+    for (const paneId of paneIds) {
+      const pane = snapshot.workspaces
+        .flatMap((workspace) => workspace.tabs)
+        .flatMap((tab) => tab.panes)
+        .find((candidate) => candidate.pane_id === paneId);
+      if (!pane) continue;
+      const { title, titleAbsent } = agentCardTitle(pane);
+      for (const node of this.root.querySelectorAll<HTMLElement>(`[data-pane-title="${CSS.escape(paneId)}"]`)) {
+        if (node.textContent !== title) node.textContent = title;
+        node.classList.toggle("absent", titleAbsent);
+      }
+    }
   }
 
   #connecting(): HTMLElement {
     return element("section", { className: "empty-state" },
       element("div", { className: "pulse" }),
-      element("h1", { text: this.#session.state === "expired" ? "Access expired" : "Connecting to Luvus" }),
-      element("p", { text: this.#session.state === "expired" ? "This device ticket expired, or this one-use pairing link was already used. Ask a connected device to create a new link." : "Authenticating and reconciling the live session." }),
+      element("h1", { text: "Connecting to Luvus" }),
+      element("p", { text: "Authenticating and reconciling the live session." }),
     );
+  }
+
+  /** Why this tab has no access, and a way to fix it without leaving the page. */
+  #accessScreen(): HTMLElement {
+    const problem = accessProblem(this.#sent);
+    const input = element("input", {
+      className: "pair-input",
+      attrs: {
+        type: "text",
+        placeholder: "Paste a pairing link",
+        "aria-label": "Pairing link or code",
+        autocomplete: "off",
+        autocapitalize: "off",
+        spellcheck: "false",
+      },
+    });
+    const form = element("form", {
+      className: "pair-form",
+      on: {
+        submit: (event) => {
+          event.preventDefault();
+          this.#pairWith(input.value);
+        },
+      },
+    },
+      input,
+      element("button", { className: "primary", text: "Connect", attrs: { type: "submit" } }),
+    );
+    return element("section", { className: "empty-state access-problem", attrs: { role: "alert" } },
+      element("h1", { text: problem.title }),
+      element("p", { text: problem.body }),
+      form,
+      this.#pairError ? element("p", { className: "pair-error", text: this.#pairError }) : undefined,
+    );
+  }
+
+  #pairWith(value: string): void {
+    const code = parsePairingInput(value);
+    if (!code) {
+      this.#pairError = "That is not a Luvus pairing link or code.";
+      this.#render();
+      return;
+    }
+    // A ticket the bridge just rejected can never work again.
+    if (this.#sent.ticket) sessionStorage.removeItem(TICKET_KEY);
+    this.#tabCode = code;
+    this.#pairError = undefined;
+    void this.start();
   }
 
   #devicePanel(): HTMLElement {
@@ -110,7 +236,10 @@ export class WebApp {
       attrs: { "aria-label": "Maximum paired devices", ...(this.#deviceLoading ? { disabled: "" } : {}) },
       on: { change: (event) => void this.#setDeviceLimit(Number((event.currentTarget as HTMLSelectElement).value)) },
     });
-    for (let limit = 1; limit <= 8; limit += 1) {
+    // The bridge refuses a limit above the operator's --max-devices, so only
+    // offer what it will accept.
+    const ceiling = status?.limit_ceiling ?? 8;
+    for (let limit = 1; limit <= ceiling; limit += 1) {
       select.append(element("option", {
         text: String(limit),
         attrs: {
@@ -245,6 +374,11 @@ export class WebApp {
       const url = rawUrl.trim();
       this.#devices = asDeviceStatus(await this.#bridge.request("web.devices.set_public_url", { url: url || null }));
       if (this.#pairingCode) this.#pairingUrl = this.#pairingLink(this.#pairingCode);
+      // The bridge may normalize the address; show what it saved rather than
+      // carrying the typed spelling into the rebuilt field. Text typed after
+      // this save was sent is newer than the save, so it is kept.
+      const field = this.root.querySelector<HTMLInputElement>(".device-url-input");
+      if (field) markFieldSaved(field, rawUrl);
       this.#render();
     } catch (error) {
       failure = error;
@@ -355,7 +489,7 @@ export class WebApp {
       ),
       this.#sessionLoading || !this.#sessions
         ? element("p", { className: "session-menu-empty", text: "Loading sessions…" })
-        : element("div", { className: "session-menu-list" }, ...this.#sessions.map((session) => {
+        : element("div", { className: "session-menu-list", attrs: { "data-scroll-key": "sessions" } }, ...this.#sessions.map((session) => {
           const active = session.name === current;
           const disabled = active || (!session.running && !canStart);
           const option = element("button", {
@@ -487,14 +621,14 @@ export class WebApp {
         ),
         element("div", { className: "agent-grid" }, ...cards.map(({ pane, context, title, state, titleAbsent, available }) => element("button", {
           className: "agent-card",
-          attrs: { type: "button", ...(available ? {} : { disabled: "", title: "Terminal unavailable" }) },
+          attrs: { type: "button", "data-view-key": `agent:${pane.pane_id}`, ...(available ? {} : { disabled: "", title: "Terminal unavailable" }) },
           on: { click: () => { if (available) this.#openTerminal(snapshot, pane); } },
         },
         element("div", { className: "agent-copy" },
           element("small", { className: "agent-context", text: context }),
-          element("strong", { className: `agent-session-title${titleAbsent ? " absent" : ""}`, text: title }),
+          element("strong", { className: `agent-session-title${titleAbsent ? " absent" : ""}`, text: title, attrs: { "data-pane-title": pane.pane_id } }),
         ),
-        element("span", { className: "agent-state", text: available ? state : "Terminal unavailable" }),
+        element("span", { className: `agent-state ${available ? paneStateClass(state) : "terminal"}`, text: available ? state : "Terminal unavailable" }),
         available ? missionIcon("arrow") : undefined,
         ))),
         cards.length === 0 ? element("p", { className: "workspace-empty", text: this.#showShells ? "No terminal panes in this session." : "No active agents. Choose All panes to show shells." }) : undefined,
@@ -522,7 +656,7 @@ export class WebApp {
     const stateClass = paneStateClass(state);
     return element("button", {
       className: `pane-tile ${stateClass}${pane.focused ? " focused" : ""}`,
-      attrs: { type: "button" },
+      attrs: { type: "button", "data-view-key": `pane:${pane.pane_id}` },
       on: { click: () => this.#openTerminal(snapshot, pane) },
     },
     element("span", { className: "pane-presence" }),
@@ -568,23 +702,7 @@ export class WebApp {
 
   #terminalPaneOptions(): TerminalPaneOption[] {
     const snapshot = this.#session.snapshot;
-    if (!snapshot) return [];
-    return snapshot.workspaces.flatMap((workspace, workspaceIndex) => {
-      const workspaceName = displayText(workspace.name, `Workspace ${workspaceIndex + 1}`);
-      return workspace.tabs.flatMap((tab, tabIndex) => {
-        const tabName = displayText(tab.name, `Tab ${tabIndex + 1}`);
-        return tab.panes.flatMap((pane, paneIndex) => {
-          if (pane.kind !== "terminal" || !pane.terminal_id) return [];
-          const agent = displayText(pane.agent_name, displayText(pane.agent, ""));
-          return [{
-            pane,
-            title: agent || `Terminal ${paneIndex + 1}`,
-            context: `${workspaceName} / ${tabName}`,
-            path: displayText(pane.cwd, displayText(workspace.cwd, "Terminal")),
-          }];
-        });
-      });
-    });
+    return snapshot ? terminalPaneOptions(snapshot) : [];
   }
 
   #showError(error: unknown): void {
@@ -613,7 +731,8 @@ function asDeviceStatus(value: unknown): DeviceStatus {
   if (!status || status.type !== "browser_device_status"
     || !Number.isSafeInteger(status.paired_devices) || !Number.isSafeInteger(status.pending_pairings)
     || !Number.isSafeInteger(status.max_devices)
-    || (status.public_url !== null && typeof status.public_url !== "string")) {
+    || (status.public_url !== null && typeof status.public_url !== "string")
+    || (status.limit_ceiling !== undefined && !Number.isSafeInteger(status.limit_ceiling))) {
     throw new BridgeError("Invalid browser device status", "invalid_response");
   }
   return status as DeviceStatus;

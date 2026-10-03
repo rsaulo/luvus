@@ -942,7 +942,6 @@ impl App {
             }
             FileMenuItem::CopyPath => {
                 self.pending_clipboard = Some(menu.path.to_string_lossy().into_owned());
-                self.show_toast("copied path");
             }
             FileMenuItem::InsertPath => {
                 match self.insert_path(&menu.path) {
@@ -1377,6 +1376,18 @@ impl App {
         // Text column width: the scroll clamp needs it to measure how many rows a
         // soft-wrapped line really occupies.
         let text_w = rect.map(|r| view_text_w(v, r.width)).unwrap_or(0);
+        // Case, wrap, and copy toggle or copy in place; a held key runs once.
+        if super::is_key_repeat(&key) {
+            let ctrl = super::keys::is_ctrl_chord(key.modifiers);
+            let action = if v.search.is_some() {
+                ctrl && key.code == KeyCode::Char('i')
+            } else {
+                matches!(key.code, KeyCode::Char('w' | 'y' | 'c'))
+            };
+            if action {
+                return true;
+            }
+        }
         // Active search owns all input. Editing accepts query text; committed
         // search accepts only navigation and search controls. Everything else
         // is swallowed so FILE commands cannot mutate or close the view under
@@ -1448,6 +1459,37 @@ mod tests {
     use crate::app::{DockKind, FileMenu, FileMenuItem, Side};
     use crate::layout::Axis;
     use ratatui::{backend::TestBackend, Terminal};
+
+    #[test]
+    fn a_held_modified_copy_or_wrap_key_acts_once() {
+        use ratatui::crossterm::event::KeyEventKind;
+
+        let _env = crate::persist::test_env("file-view-modified-copy-repeat");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        let mut view = crate::files::FileView::new("sample.txt".into());
+        view.apply(crate::files::FileLoad::Text(vec!["text".into()]));
+        app.views.insert(pane, ViewKind::File(view));
+        let phase = |code, kind| {
+            crate::event::AppEvent::Key(KeyEvent::new_with_kind(code, KeyModifiers::CONTROL, kind))
+        };
+
+        app.handle_event(phase(KeyCode::Char('y'), KeyEventKind::Press));
+        assert_eq!(app.pending_clipboard.as_deref(), Some("text"));
+        app.pending_clipboard = None;
+        app.handle_event(phase(KeyCode::Char('y'), KeyEventKind::Repeat));
+        assert!(app.pending_clipboard.is_none(), "one copy per press");
+
+        let wrap = |app: &App| match &app.views[&pane] {
+            ViewKind::File(view) => view.wrap,
+            _ => panic!("file view retained"),
+        };
+        app.handle_event(phase(KeyCode::Char('w'), KeyEventKind::Press));
+        let toggled = wrap(&app);
+        app.handle_event(phase(KeyCode::Char('w'), KeyEventKind::Repeat));
+        assert_eq!(wrap(&app), toggled, "one wrap toggle per press");
+    }
 
     #[test]
     fn file_search_consumes_non_search_shortcuts_before_and_after_commit() {
@@ -1719,8 +1761,8 @@ mod tests {
         app.handle_file_tree_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
         assert_eq!(app.file_tree.cursor, 3);
         assert_eq!(
-            app.file_tree.scroll, 3,
-            "the one rendered row keeps the last entry in view"
+            app.file_tree.scroll, 2,
+            "the two rendered rows keep the last entry in view"
         );
 
         app.handle_file_tree_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
@@ -3050,7 +3092,7 @@ mod tests {
         assert_eq!(
             first_row_y,
             header_y + crate::ui::DOCK_HEADER_ROWS,
-            "the list starts one blank row below FILES/DIFF, with no identity row"
+            "the list starts directly below FILES/DIFF, with no identity row"
         );
 
         // Click the `src` row (find its rect) and re-render.
@@ -4454,6 +4496,77 @@ mod tests {
             "the listing replaces the loading line"
         );
         assert!(text.contains("README.md"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Filtering owns its own file index, so it can return matches before the
+    /// lazy root listing arrives. The loading affordance must not hide those
+    /// results or their hit rectangles.
+    #[test]
+    fn files_filter_remains_visible_while_the_root_listing_loads() {
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+        let _env = crate::persist::test_env("files-filter-during-root-loading");
+        let root =
+            std::env::temp_dir().join(format!("luvus-filter-root-loading-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let match_path = root.join("match.rs");
+        std::fs::write(&match_path, b"// match").unwrap();
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        app.workspaces[app.active_ws].cwd = root.clone();
+        app.sidebars.left.docks.push(DockKind::Files);
+        app.ensure_file_tree();
+        assert!(!app.file_tree.root_loaded());
+
+        app.files_focused = true;
+        app.handle_file_tree_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        app.handle_file_tree_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        let filter = app.file_tree.filter.as_ref().unwrap();
+        assert!(app.handle_event(AppEvent::FileFilterResults {
+            instance: filter.instance,
+            generation: filter.generation,
+            rows: vec![crate::files::VisibleRow {
+                path: match_path.clone(),
+                name: "match.rs".into(),
+                depth: 0,
+                is_dir: false,
+                expanded: false,
+                loading: false,
+            }],
+            partial: false,
+        }));
+
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        let text = buffer_text(&term);
+        assert!(text.contains("f: m"), "the active query remains visible");
+        assert!(text.contains("match.rs"), "the indexed match is rendered");
+        assert_eq!(
+            app.file_tree_rects.len(),
+            1,
+            "the indexed match remains clickable"
+        );
+        let rect = app.file_tree_rects[0].1;
+        assert!(app.handle_event(crate::event::AppEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x + 3,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        })));
+        let preview = app.layout().focus;
+        assert_eq!(
+            shown(&app, preview),
+            match_path,
+            "clicking the filtered row opens the match while the root is pending"
+        );
+        assert!(
+            app.preview_views.contains(&preview),
+            "the default click route opened the reusable preview"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

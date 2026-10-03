@@ -63,6 +63,11 @@ Open Mission Control with `Ctrl+Space m`, from the desktop switcher, or with
 workspace-scoped operation through UHP as `mission.open`. To read Mission
 Control data without opening or focusing the tab, use `mission.snapshot`; use
 `mission.refresh` only when fresh native usage counters are needed.
+For UHP, keep the returned `refresh_id` and read `mission.snapshot` after its
+`refresh.completed_id` reaches that ID. `usage:null` means unknown, not zero;
+`usage_status` explains whether the row is unrefreshed, in flight, unbound to a
+native session, unsupported, or unavailable after a scan. Summary totals are
+known subtotals when `usage_coverage` is incomplete.
 
 Mission Control reads the structured usage counters that each agent already
 stores for its own session. It shows input, output, and cache tokens, context
@@ -209,7 +214,26 @@ recorded when Luvus resumes a session. Luvus never guesses the newest Codex
 rollout in a shared folder, because that could fork another pane's active
 conversation. Install or refresh the Codex hook with
 `luvus integration install codex`; its SessionStart and prompt hooks bind new
-and resumed Codex panes to their exact rollout.
+and resumed Codex panes to their exact rollout. Refresh it after upgrading
+Luvus so the hook script matches the installed binary.
+
+Recent Codex versions run sessions in a shared background server, which runs
+every session's hooks with the environment of whichever pane first started it.
+The Codex hook therefore proves that it runs inside the pane it reports for.
+When it does not, as with a session in that shared server, it finds the pane
+by its working directory and the prompt just submitted, and binds only when
+exactly one Codex pane shows that prompt. A Codex session is bound from its
+first prompt, since that is when Codex creates it. After a restart, Luvus
+resumes the session in the same pane and keeps it bound there.
+
+Codex runs no hook when a conversation is resumed, so a pane resumed from the
+`codex resume` picker has no report until its next prompt. When Luvus saves
+its restart snapshot, such a pane is still resolved from its terminal title:
+Codex titles the pane with the conversation's name, and Luvus resumes the one
+conversation in that directory with that name. This needs a name no other
+conversation in the directory uses and Codex's default terminal title, which
+puts the name first. Otherwise the pane restores as a shell, unless it is the
+only Codex pane in its directory and that directory has only one conversation.
 
 Kilo Code also requires an exact session ID for resume or fork. Luvus detects
 the `kilo` and `kilocode` executables natively, but it does not scan Kilo's
@@ -395,6 +419,14 @@ Priorities follow the built-ins: blocked prompts sit around 300, working hints
 around 100 to 200. Give a rule a higher number than the built-in you want it to
 beat. A file that fails to parse is skipped with a warning, so a typo never
 takes detection down.
+
+For Claude Code, luvus first checks whether its live input box is on screen.
+While it is, Claude cannot be showing a menu, because its menus and approval
+prompts replace the input box. In that case `blocked` screen rules are skipped,
+and other screen rules see only Claude's status line, its input box, and the
+rows below it. Earlier conversation text, such as a diff or a relayed message
+that contains "Enter to select · Esc to cancel", therefore never changes the
+state. Title rules still apply as usual.
 
 ## Agents can drive luvus
 

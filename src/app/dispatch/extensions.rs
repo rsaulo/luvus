@@ -641,7 +641,13 @@ impl App {
                 "warning": m.warning,
                 "platforms": m.manifest.platforms,
                 "actions": m.manifest.actions.iter()
-                    .map(|a| json!({"id": a.id, "title": a.title, "contexts": a.contexts})).collect::<Vec<_>>(),
+                    .map(|a| {
+                        let mut item = json!({"id": a.id, "title": a.title, "contexts": a.contexts});
+                        if let Some(commander) = &a.commander {
+                            item["commander"] = json!(commander);
+                        }
+                        item
+                    }).collect::<Vec<_>>(),
                 "panes": m.manifest.panes.iter()
                     .map(|pe| json!({"id": pe.id, "title": pe.title, "placement": pe.placement})).collect::<Vec<_>>(),
                 "bars": m.manifest.bars.iter()
@@ -709,12 +715,16 @@ impl App {
             let mut arr = Vec::new();
             for m in &self.modules.modules {
                 for a in &m.manifest.actions {
-                    arr.push(json!({
+                    let mut item = json!({
                         "module": m.id, "action": a.id,
                         "qualified": format!("{}.{}", m.id, a.id),
                         "title": a.title, "contexts": a.contexts,
                         "runnable": m.is_runnable(),
-                    }));
+                    });
+                    if let Some(commander) = &a.commander {
+                        item["commander"] = json!(commander);
+                    }
+                    arr.push(item);
                 }
             }
             Ok(json!({"type":"module_action_list","actions":arr}))
@@ -908,12 +918,21 @@ impl App {
                 ));
             }
             if method == "mission.refresh" {
-                self.request_mission_usage_refresh_for(scope, workspace);
+                let refresh_id = self
+                    .request_mission_usage_refresh_for(scope, workspace)
+                    .ok_or_else(|| {
+                        (
+                            "resource_exhausted".to_string(),
+                            "too many pending Mission Control refreshes".to_string(),
+                        )
+                    })?;
                 Ok(json!({
                     "type":"mission_refresh",
                     "scope":match scope { crate::mission::MissionScope::Workspace => "workspace", crate::mission::MissionScope::All => "all" },
                     "workspace":workspace.to_string(),
                     "refreshing":true,
+                    "refresh_id":refresh_id.to_string(),
+                    "server_generation":self.backend_server_generation,
                 }))
             } else {
                 Ok(self.mission_snapshot_value(scope, workspace))
